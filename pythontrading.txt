@@ -1,0 +1,3276 @@
+#!/usr/bin/env python3
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║        INSTITUTIONAL ALPHA ENGINE — VERSION 5.0 (Python / MT5)              ║
+# ║        DUAL-ENGINE DYNAMIC CORE  ·  24-HOUR FULL COVERAGE                   ║
+# ║                                                                              ║
+# ║  ENGINE 1 — Kill Zone SMC (6 hrs/day)                                        ║
+# ║     London Open 07:00–10:00 UTC + NY Open 12:00–15:00 UTC                   ║
+# ║     Logic: MSS + Order Block + FVG + Volume + DXY + Delta + VP + VIX        ║
+# ║     Gate: 4 of 5 SMC criteria + all Alpha Filters                           ║
+# ║     RR: 1:2 minimum, 1:3 target with ATR trailing                           ║
+# ║                                                                              ║
+# ║  ENGINE 2 — Off-Kill-Zone Mean Reversion (13 hrs/day)                        ║
+# ║     Asian session + London-NY Bridge + Late NY                               ║
+# ║     Logic: Asia Range + BB(20,3σ) Sweep + Vol Exhaust + Reject + RSI        ║
+# ║     Gate: ALL 5 conditions must fire                                          ║
+# ║     RR: 1:1 to 1:1.5, TP = VWAP/20-SMA                                      ║
+# ║                                                                              ║
+# ║  RISK: MaxTrades=1 · FixedLot=0.01 · BE=+7pip · MaxSpread=1.2pip           ║
+# ║  NEURAL FEEDBACK v2: Per-engine circuit breaker at <65% accuracy            ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  REQUIREMENTS:
+#  pip install MetaTrader5 pandas numpy pytz rich
+# ──────────────────────────────────────────────────────────────────────────────
+
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
+import pytz
+import time
+import threading
+import logging
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Tuple, Any
+from enum import IntEnum
+from collections import deque
+import threading as _threading
+
+# Rich for beautiful terminal dashboard
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.text import Text
+    from rich import box
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  LOGGING SETUP
+# ──────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler('alpha_engine_v5.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger('AlphaEngine_v5')
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 1 — CONFIGURATION (equivalent to MQL5 input parameters)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Config:
+    # ── Connection ─────────────────────────────────────────────────────────────
+    SYMBOL:               str   = "EURUSD"       # Trading symbol
+    MAGIC:                int   = 20260005        # EA magic number
+    GMT_OFFSET:           int   = 0              # Broker GMT offset (0=UTC)
+
+    # ── Session Timing (DST-AWARE) ───────────────────────────────────────────
+    # London Kill Zone: 08:00-11:00 UK Time (adjusts for DST automatically)
+    LONDON_KZ_START_UK:   int   = 8              # London KZ start (UK time)
+    LONDON_KZ_END_UK:     int   = 11             # London KZ end (UK time)
+    # NY Kill Zone: 08:00-11:00 EST (13:00-16:00 UTC during EST, 12:00-15:00 UTC during EDT)
+    NY_KZ_START_EST:      int   = 8              # NY KZ start (EST)
+    NY_KZ_END_EST:        int   = 11             # NY KZ end (EST)
+    ASIA_OPEN:            int   = 0              # Asian session open (UTC)
+    ASIA_RANGE_HOURS:     int   = 4              # Hours to build Asia box
+    DEAD_ZONE_START:      int   = 20             # Dead zone start (UTC)
+    
+    # ── Session Momentum Filter ───────────────────────────────────────────────
+    SESSION_MOMENTUM_BARS: int  = 6              # First 30 min (6x M5) for bias detection
+
+    # ── Engine 1: SMC Core ────────────────────────────────────────────────────
+    HTF_TF:               int   = mt5.TIMEFRAME_H1   # Higher TF for OB/bias
+    HTF_TF2:              int   = mt5.TIMEFRAME_H4   # Second HTF for confirmation
+    ENTRY_TF:             int   = mt5.TIMEFRAME_M5   # Entry timeframe
+    FVG_TF:               int   = mt5.TIMEFRAME_M15  # FVG timeframe
+    ADX_TF:               int   = mt5.TIMEFRAME_M15  # ADX/ATR timeframe (M15=faster refresh)
+    OB_LOOKBACK:          int   = 50             # Order Block lookback bars
+    
+    # ── OB Freshness & Age Filter (NEW) ─────────────────────────────────────
+    OB_MIN_AGE_BARS:      int   = 3              # Minimum bar age for valid OB
+    OB_MAX_AGE_BARS:      int   = 20             # Maximum bar age (older = ignore)
+    OB_PRICE_BUFFER_PIPS: float = 10.0           # Tighter proximity buffer (was 20)
+    
+    # ── FVG Improvements (NEW) ───────────────────────────────────────────────
+    FVG_MIN_PIPS:         float = 2.0            # FVG min pips
+    FVG_MAX_AGE_BARS:     int   = 10             # Max age for valid FVG
+    FVG_MITIGATION_CHECK: bool  = True           # Check if FVG is not fully filled
+    
+    # ── Entry Conditions (STRICTER) ─────────────────────────────────────────
+    MIN_CONFIRMATIONS:    int   = 4              # Min of 5 pillars (increased 3→4)
+    VOL_SPIKE_MULT:       float = 1.5            # Volume spike (increased 1.3→1.5)
+    VOL_MA_PERIOD:        int   = 20             # Volume MA period
+    RSI_PERIOD:           int   = 14             # RSI period
+    MACD_FAST:            int   = 12             # MACD fast
+    MACD_SLOW:            int   = 26             # MACD slow
+    MACD_SIGNAL:          int   = 9              # MACD signal
+    ADX_PERIOD:           int   = 14             # ADX period
+    ADX_MIN:              float = 25.0           # ADX min (increased 20→25 for quality)
+    ADX_STRONG:           float = 35.0           # ADX for strong trend confirmation
+    DIV_LOOKBACK:         int   = 8              # Divergence lookback (extended 5→8)
+    ATR_PERIOD:           int   = 14             # ATR period
+    ATR_SL_MULT:          float = 1.5            # ATR SL multiplier
+    E1_TP1_RR:            float = 2.0            # Engine 1 TP1 R:R
+    E1_TP2_RR:            float = 3.0            # Engine 1 TP2 R:R
+    OB_MIN_STRENGTH:      float = 50.0           # OB minimum strength (increased 35→50)
+    
+    # ── Displacement Detection (NEW) ──────────────────────────────────────────
+    USE_DISPLACEMENT:     bool  = True           # Enable displacement detection
+    DISP_LOOKBACK:        int   = 20             # Lookback bars for displacement
+    DISP_MIN_BARS:        int   = 2              # Minimum bars to engulf
+    DISP_MIN_VOL_MULT:    float = 1.5            # Volume must be 1.5x average
+    
+    # ── Breaker Block Detection (NEW) ─────────────────────────────────────────
+    USE_BREAKER_BLOCK:    bool  = True           # Enable breaker block detection
+    BB_LOOKBACK:          int   = 30             # Lookback for breaker blocks
+    
+    # ── Volume Absorption (NEW) ───────────────────────────────────────────────
+    USE_ABSORPTION:       bool  = True           # Enable volume absorption check
+    ABSORPTION_LOOKBACK:  int   = 20             # Bars to check for absorption
+    ABSORPTION_VOL_MULT:  float = 2.0            # Absorption volume must be 2x avg
+    
+    # ── Liquidity Sweep Quality (NEW) ─────────────────────────────────────────
+    LIQ_SWEEP_QUALITY:    bool  = True           # Enable sweep quality check
+    LIQ_REVERSAL_BARS:    int   = 5              # Must reverse within X bars
+    LIQ_VOL_CONFIRM:      float = 1.3            # Volume at sweep must spike
+    
+    # ── Spread Tolerance (KILL ZONE SPECIFIC) ────────────────────────────────
+    MAX_SPREAD_POINTS_E1: float = 12             # Max spread in points
+    KZ_SPREAD_TOLERANCE:  float = 2.0            # Extra spread tolerance in Kill Zone
+    MAX_SPREAD_PIPS:      float = 1.5            # Max spread for E2
+
+    # ── Engine 1: DXY Guard ───────────────────────────────────────────────────
+    USE_DXY:              bool  = True           # Enable DXY correlation guard
+    DXY_SYMBOL:           str   = "DXY"          # DXY symbol on broker
+    DXY_LOOKBACK:         int   = 20             # DXY trend lookback bars
+
+    # ── Engine 1: Volume Profile ──────────────────────────────────────────────
+    USE_VP:               bool  = True           # Enable Volume Profile
+    VP_BARS:              int   = 100            # VP calculation bars
+    VP_BUCKETS:           int   = 50             # VP price buckets
+    VP_VALUE_AREA_PCT:    float = 70.0           # Value Area percentage
+    VP_POC_BUFFER_PIPS:   float = 5.0            # POC avoidance buffer (pips)
+
+    # ── Engine 1: VIX Cap ─────────────────────────────────────────────────────
+    USE_VIX:              bool  = True           # Enable VIX cap
+    VIX_SYMBOL:           str   = "VIX"          # Real VIX symbol (not VIX75!)
+    VIX_MAX_LEVEL:        float = 25.0           # VIX halt threshold (lowered 30→25)
+    VIX_CAUTION_LEVEL:    float = 20.0           # VIX caution level
+
+    # ── Engine 2: Mean Reversion (IMPROVED) ───────────────────────────────────
+    E2_TF:                int   = mt5.TIMEFRAME_M5   # Engine 2 sweep TF
+    E2_CONFIRM_TF:        int   = mt5.TIMEFRAME_M1   # Engine 2 confirmation TF
+    E2_BB_PERIOD:         int   = 20             # Bollinger Band period
+    E2_BB_STDDEV:         float = 2.0            # BB standard deviation (tightened 3→2)
+    E2_RSI_OB:            float = 65.0           # RSI overbought
+    E2_RSI_OS:            float = 35.0           # RSI oversold
+    E2_MIN_ASIA_RANGE:    float = 25.0           # Minimum Asia range in pips (increased 10→25)
+    E2_SWEEP_MIN_PIPS:    float = 2.0            # Min sweep pips (relaxed 3→2)
+    E2_REJECTION_BARS:    int   = 5              # Rejection lookback (extended 3→5)
+    E2_PINBAR_WICK_PCT:   int   = 50             # Pin bar wick % (relaxed 60→50)
+    E2_VOL_EXHAUST:       float = 0.85           # Vol exhaustion (relaxed 0.75→0.85)
+    E2_VWAP_BARS:         int   = 100            # VWAP calculation bars
+    E2_VWAP_ANCHORED:     bool  = True           # Anchor VWAP to session start
+    
+    # ── Position Management (IMPROVED v5.1) ───────────────────────────────────
+    BE_TRIGGER_PIPS_E2:    float = 10.0           # E2 BE trigger in pips (increased 7→10)
+    TRAIL_ATR_MULT_V2:     float = 0.75           # Tighter ATR trailing (was 1.0)
+    
+    # ── Neural Feedback (IMPROVED v5.1) ──────────────────────────────────────
+    NF_TRADE_MEMORY:       int   = 50             # Minimum trades for circuit breaker (increased 10→50)
+    E2_TP_MIN_PIPS:       float = 8.0            # Min TP pips
+    E2_TP_MAX_PIPS:       float = 15.0           # Max TP pips
+    E2_TP_RR:             float = 1.5            # Engine 2 R:R target
+
+    # ── Risk Management ($10 Micro Account) ───────────────────────────────────
+    RISK_PCT:             float = 1.0            # Risk % of balance (E1)
+    FIXED_LOT:            float = 0.01           # Fixed lot for E2 (locked)
+    MAX_SPREAD_PIPS:      float = 2.5            # Max spread pips E2 (relaxed 1.2→2.5)
+    MAX_SPREAD_POINTS_E1: int   = 25             # Max spread points E1 (relaxed 15→25)
+    MAX_GLOBAL_TRADES:    int   = 1              # Max 1 trade globally (all symbols combined)
+    MAX_SLIPPAGE:         int   = 3              # Max slippage points
+    # FIX ④: MT5 disconnect guard — block trading if live data older than this
+    MT5_STALE_BLOCK_SEC:  int   = 60             # seconds before stale data blocks trades
+    BE_TRIGGER_PIPS:      float = 7.0            # BE trigger (E2)
+    BE_BUFFER_PIPS:       float = 0.5            # BE buffer (E2)
+    BE_TRIGGER_POINTS_E1: int   = 100            # BE trigger points (E1)
+    BE_BUFFER_PIPS_E1:    int   = 5              # BE buffer pips (E1)
+    PARTIAL_CLOSE_PCT:    float = 50.0           # Partial close % at TP1
+    TRAIL_ATR_MULT:       float = 1.0            # Trailing ATR multiplier
+    TRAIL_STEP_POINTS:    float = 10.0           # Trailing step points
+
+    # ── Neural Feedback ───────────────────────────────────────────────────────
+    NF_TRADE_MEMORY:      int   = 10             # Rolling accuracy window
+    NF_MIN_ACCURACY:      float = 65.0           # Circuit breaker threshold
+    NF_PAUSE_MINS:        int   = 120            # Circuit breaker pause mins
+
+    # ── News Filter ───────────────────────────────────────────────────────────
+    USE_NEWS_FILTER:      bool  = False          # Enable news filter (requires API)
+    NEWS_GUARD_MINS:      int   = 15             # Minutes around news events
+
+    # ── Execution ─────────────────────────────────────────────────────────────
+    POLL_INTERVAL_SEC:    float = 2.0            # Main loop poll (faster 5→2s)
+    DISPLAY_INTERVAL_SEC: float = 3.0            # Dashboard refresh interval
+    POSITION_MGMT_SEC:   float = 1.0            # Position management interval
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — ENUMERATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EngineState(IntEnum):
+    KILL_ZONE_SMC     = 1    # Engine 1: London/NY Kill Zones
+    OFFZONE_REVERSION = 2    # Engine 2: Asian/Late-NY Mean Reversion
+    DEAD_ZONE         = 3    # No trading (20:00–00:00 UTC)
+
+class MarketBias(IntEnum):
+    BULL    = 1
+    BEAR    = -1
+    RANGING = 0
+    UNKNOWN = 99
+
+class TradeDirection(IntEnum):
+    BUY  =  1
+    SELL = -1
+    NONE =  0
+
+class FilterFailure(IntEnum):
+    PASS         = 0
+    KILL_ZONE    = 1
+    DXY_CORR     = 2
+    DELTA        = 3
+    VOL_PROFILE  = 4
+    VIX          = 5
+    SPREAD       = 6
+    NEWS         = 7
+    SMC          = 8
+    SUSPENDED    = 9
+    NO_RANGE     = 10
+    NO_SWEEP     = 11
+    NO_REJECTION = 12
+    RSI          = 13
+    VOLUME       = 14
+    LOW_RR       = 15
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — DATA STRUCTURES
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class OrderBlock:
+    hi:        float
+    lo:        float
+    time:      datetime
+    is_bull:   bool
+    is_valid:  bool = True
+    strength:  float = 50.0
+
+@dataclass
+class FairValueGap:
+    hi:        float
+    lo:        float
+    time:      datetime
+    is_bull:   bool
+    is_filled: bool = False
+    size_pips: float = 0.0
+
+@dataclass
+class VolumeProfileResult:
+    poc:          float = 0.0
+    vah:          float = 0.0
+    val:          float = 0.0
+    is_valid:     bool  = False
+
+@dataclass
+class AsiaRangeBox:
+    hi:           float    = 0.0
+    lo:           float    = 0.0
+    mid:          float    = 0.0
+    size_pips:    float    = 0.0
+    built_date:   Optional[datetime] = None
+    is_valid:     bool     = False
+    hi_swept:     bool     = False
+    lo_swept:     bool     = False
+
+@dataclass
+class SweepEvent:
+    detected:     bool           = False
+    direction:    TradeDirection  = TradeDirection.NONE
+    sweep_price:  float          = 0.0
+    bb_level:     float          = 0.0
+    sweep_time:   Optional[datetime] = None
+    sweep_bar_idx: int           = 0
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NEW ICT DATA STRUCTURES (v5.1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DisplacementEvent:
+    """Institutional displacement = engulfing candle with volume confirmation"""
+    detected:         bool           = False
+    direction:        TradeDirection = TradeDirection.NONE
+    engulf_bars:      int            = 0      # How many bars were engulfed
+    displacement_pips: float          = 0.0   # Size of displacement
+    volume_ratio:      float          = 0.0   # Volume at displacement vs average
+    time:             Optional[datetime] = None
+
+@dataclass
+class BreakerBlock:
+    """Breaker Block = When previous structure breaks and price returns to test it"""
+    hi:               float          = 0.0
+    lo:               float          = 0.0
+    time:             Optional[datetime] = None
+    is_bull:          bool           = True   # Bullish or bearish breaker
+    strength:         float          = 0.0
+    is_valid:         bool           = False
+    was_broken:       bool           = False  # If this breaker was subsequently broken
+
+@dataclass
+class LiquidityPool:
+    """Liquidity Pool = Equal highs/lows, weekend gaps, stop clusters"""
+    pool_type:        str            = ""     # "equal_highs", "equal_lows", "weekend_gap", "stop_cluster"
+    price:            float          = 0.0
+    strength:         float          = 0.0
+    touches:          int            = 0       # Number of touches
+    is_swept:         bool           = False
+    time:             Optional[datetime] = None
+
+@dataclass
+class AbsorptionResult:
+    """Volume absorption = When institutions absorb selling/buying pressure"""
+    detected:         bool           = False
+    direction:        TradeDirection = TradeDirection.NONE
+    absorption_price: float          = 0.0
+    volume_ratio:      float          = 0.0   # How much volume absorbed
+    is_fresh:         bool           = True   # Not yet traded through
+
+@dataclass
+class SessionMomentum:
+    """Session momentum based on first 30 min of Kill Zone"""
+    direction:        TradeDirection = TradeDirection.NONE
+    strength:         float          = 0.0   # 0-100%
+    consecutive_bars:  int            = 0     # Consecutive bars in momentum direction
+    total_bars:       int            = 0     # Total bars analyzed
+
+@dataclass
+class SMCResult:
+    """Complete SMC evaluation result for Engine 1"""
+    fired:              bool            = False
+    direction:          TradeDirection  = TradeDirection.NONE
+    block_reason:       FilterFailure   = FilterFailure.PASS
+
+    # SMC Pillars
+    smc_score:          int   = 0
+    has_ob:             bool  = False
+    has_fvg:            bool  = False
+    has_vol_spike:      bool  = False
+    has_divergence:     bool  = False
+    has_adx:            bool  = False
+    has_adx_strong:     bool  = False  # NEW: ADX >= 35 for strong trend
+    has_liq_sweep:      bool  = False
+    ob_strength:        float = 0.0
+    
+    # NEW ICT Concepts (v5.1)
+    has_displacement:   bool  = False  # Institutional displacement detected
+    has_breaker_block:  bool  = False  # Breaker block confirmed
+    has_absorption:     bool  = False  # Volume absorption detected
+    has_session_momentum: bool = False  # Session momentum aligned
+    
+    # Displacement details
+    displacement_pips:  float = 0.0
+    displacement_bars:  int   = 0
+    
+    # Breaker block details
+    breaker_strength:   float = 0.0
+    
+    # Absorption details
+    absorption_ratio:   float = 0.0
+    
+    # Session momentum details
+    momentum_strength:  float = 0.0
+    momentum_direction: TradeDirection = TradeDirection.NONE
+
+    # Alpha Filters
+    in_kill_zone:       bool  = False
+    kill_zone_type:     str   = ""     # "LONDON", "NY", or ""
+    dxy_confirmed:      bool  = False
+    delta_positive:     bool  = False
+    vp_zone_valid:      bool  = False
+    vix_clear:          bool  = True
+    vix_level:          float = 0.0
+    vix_caution:        bool  = False  # NEW: VIX in caution zone
+
+    # Confidence
+    confidence:         float = 0.0
+    adx_value:          float = 0.0
+    spread_pips:        float = 0.0
+
+    # Trade Levels
+    sl_price:           float = 0.0
+    tp1_price:          float = 0.0
+    tp2_price:          float = 0.0
+
+    # VP
+    vp:                 VolumeProfileResult = field(default_factory=VolumeProfileResult)
+
+    # FIX ②: OB nearest distance string — populated in evaluate(), read by dashboard
+    nearest_ob_info:    str  = ""
+    
+    # OB Freshness (NEW)
+    ob_age_bars:        int   = 0      # Age of the OB in bars
+    ob_is_fresh:        bool  = False  # OB has not been touched since formation
+
+@dataclass
+class ReversionResult:
+    """Complete evaluation result for Engine 2"""
+    fired:            bool           = False
+    direction:        TradeDirection = TradeDirection.NONE
+    block_reason:     FilterFailure  = FilterFailure.PASS
+
+    c1_range_valid:   bool  = False
+    c2_sweep:         bool  = False
+    c3_vol_exhaust:   bool  = False
+    c4_rejection:     bool  = False
+    c5_rsi_extreme:   bool  = False
+
+    sweep_level:      float = 0.0
+    sl_price:         float = 0.0
+    tp_price:         float = 0.0
+    entry_price:      float = 0.0
+    confidence:       float = 0.0
+    vwap:             float = 0.0
+    spread_pips:      float = 0.0
+
+@dataclass
+class TradeRecord:
+    is_win:       bool
+    profit:       float
+    close_time:   datetime
+    engine:       EngineState
+    confidence:   float
+
+@dataclass
+class EngineStats:
+    total_trades:   int   = 0
+    wins:           int   = 0
+    accuracy:       float = 100.0
+    is_paused:      bool  = False
+    paused_until:   Optional[datetime] = None
+    today_trades:   int   = 0
+    today_pnl:      float = 0.0
+
+    def record(self, is_win: bool, profit: float):
+        self.total_trades += 1
+        self.today_trades += 1
+        self.today_pnl   += profit
+        if is_win:
+            self.wins += 1
+        if self.total_trades > 0:
+            self.accuracy = self.wins / self.total_trades * 100.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4 — INDICATOR CALCULATOR (pure numpy/pandas — no talib required)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Indicators:
+    """All indicator calculations using pure pandas/numpy"""
+
+    @staticmethod
+    def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+        """RSI Fix: handle all-gain or all-loss periods, fill NaN with 50 (neutral)"""
+        delta = close.diff()
+        gain  = delta.clip(lower=0)
+        loss  = -delta.clip(upper=0)
+        avg_g = gain.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+        avg_l = loss.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+        avg_l_safe = avg_l.replace(0, np.nan)
+        rs    = avg_g / avg_l_safe
+        rsi_  = 100.0 - (100.0 / (1.0 + rs))
+        # When avg_l=0 (all gains): RSI=100; when avg_g=0 (all losses): RSI=0
+        rsi_  = rsi_.fillna(50.0)  # neutral fill for warmup period
+        return rsi_
+
+    @staticmethod
+    def macd(close: pd.Series, fast=12, slow=26, signal=9):
+        """MACD Fix: min_periods and fillna to prevent NaN in short series"""
+        ema_f = close.ewm(span=fast,   min_periods=fast,   adjust=False).mean()
+        ema_s = close.ewm(span=slow,   min_periods=slow,   adjust=False).mean()
+        macd_ = (ema_f - ema_s).fillna(0.0)
+        sig_  = macd_.ewm(span=signal, min_periods=signal, adjust=False).mean().fillna(0.0)
+        hist_ = (macd_ - sig_).fillna(0.0)
+        return macd_, sig_, hist_
+
+    @staticmethod
+    def atr(high: pd.Series, low: pd.Series, close: pd.Series, period=14) -> pd.Series:
+        """ATR Fix: add min_periods and fillna(0) to prevent NaN cascade"""
+        prev_c = close.shift(1)
+        tr     = pd.concat([
+            high - low,
+            (high - prev_c).abs(),
+            (low  - prev_c).abs()
+        ], axis=1).max(axis=1)
+        result = tr.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+        return result.fillna(0.0)
+
+    @staticmethod
+    def adx(high: pd.Series, low: pd.Series, close: pd.Series, period=14) -> pd.Series:
+        """
+        ADX Fix: preserve original datetime index when using np.where.
+        np.where returns numpy array (integer index 0,1,2...) which
+        misaligns with atr14's datetime index causing all-NaN output.
+        Solution: wrap np.where result in pd.Series(result, index=high.index)
+        """
+        high  = high.reset_index(drop=True)
+        low   = low.reset_index(drop=True)
+        close = close.reset_index(drop=True)
+
+        prev_h = high.shift(1)
+        prev_l = low.shift(1)
+        prev_c = close.shift(1)
+
+        up_move   = high  - prev_h
+        down_move = prev_l - low
+
+        plus_dm  = np.where((up_move > down_move) & (up_move > 0),   up_move,   0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+        plus_dm  = pd.Series(plus_dm,  dtype=float)
+        minus_dm = pd.Series(minus_dm, dtype=float)
+
+        tr = pd.concat([
+            high - low,
+            (high - prev_c).abs(),
+            (low  - prev_c).abs()
+        ], axis=1).max(axis=1)
+
+        # Use Wilder's smoothing (EWM with alpha=1/period)
+        atr14    = tr.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+        pdm14    = plus_dm.ewm(alpha=1.0/period,  min_periods=period, adjust=False).mean()
+        mdm14    = minus_dm.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+
+        atr14_safe = atr14.replace(0, np.nan)
+        plus_di  = 100.0 * pdm14 / atr14_safe
+        minus_di = 100.0 * mdm14 / atr14_safe
+
+        denom    = (plus_di + minus_di).replace(0, np.nan)
+        dx       = 100.0 * (plus_di - minus_di).abs() / denom
+        adx_     = dx.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+        return adx_.fillna(0.0)
+
+    @staticmethod
+    def bollinger_bands(close: pd.Series, period=20, std_dev=2.0):
+        """BB Fix: handle flat price (std=0) and short series (NaN)"""
+        sma   = close.rolling(period, min_periods=period//2).mean()
+        std   = close.rolling(period, min_periods=period//2).std(ddof=0).fillna(0.0)
+        std   = std.replace(0, close.mean() * 0.001)  # tiny non-zero std for flat price
+        upper = (sma + std_dev * std).fillna(close)
+        lower = (sma - std_dev * std).fillna(close)
+        sma   = sma.fillna(close)
+        return upper, sma, lower
+
+    @staticmethod
+    def ema(close: pd.Series, period: int) -> pd.Series:
+        return close.ewm(span=period, adjust=False).mean()
+
+    @staticmethod
+    def sma(close: pd.Series, period: int) -> pd.Series:
+        return close.rolling(period).mean()
+
+    @staticmethod
+    def linear_regression_slope(series: pd.Series) -> float:
+        """
+        Linear regression slope with full NaN protection.
+        Returns positive float = uptrend, negative = downtrend, 0.0 = flat/error.
+        """
+        try:
+            if series is None or len(series) < 3:
+                return 0.0
+            y = np.array(series.values, dtype=float)
+            valid = np.isfinite(y)
+            if valid.sum() < 3:
+                return 0.0
+            y = y[valid]
+            n = len(y)
+            x = np.arange(n, dtype=float)
+            # Normalise x to avoid float overflow on large indices
+            x = x - x.mean()
+            sx2   = np.dot(x, x)
+            if sx2 < 1e-12:
+                return 0.0
+            slope = np.dot(x, y - y.mean()) / sx2
+            return float(slope) if np.isfinite(slope) else 0.0
+        except Exception:
+            return 0.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 5 — MT5 DATA LAYER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MT5DataLayer:
+    """Handles all MT5 data fetching with caching"""
+
+    # Per-timeframe cache TTL (seconds)
+    _TF_TTL = {
+        mt5.TIMEFRAME_M1:  10,    # M1 bars: 10s cache
+        mt5.TIMEFRAME_M5:  20,    # M5 bars: 20s cache
+        mt5.TIMEFRAME_M15: 60,    # M15 bars: 60s cache
+        mt5.TIMEFRAME_H1:  180,   # H1 bars: 3min cache
+        mt5.TIMEFRAME_H4:  600,   # H4 bars: 10min cache
+    }
+
+    def __init__(self, cfg: Config):
+        self.cfg   = cfg
+        self._cache: Dict[str, Tuple[datetime, Any]] = {}
+        self._cache_ttl_sec = 15  # Default cache TTL
+        self._lock = _threading.Lock()  # FIX: thread-safe cache access
+        # FIX ④: Track the last time MT5 returned live (non-None) data
+        self._last_live_fetch: datetime = datetime.now()
+        self._stale_block_sec: int = getattr(cfg, 'MT5_STALE_BLOCK_SEC', 60)
+
+    def is_data_stale(self) -> bool:
+        """
+        FIX ④: Returns True if MT5 has not delivered fresh data within
+        MT5_STALE_BLOCK_SEC seconds.  Call this in on_bar() before trading.
+        When MT5 disconnects mid-TTL the cache silently keeps serving old values;
+        this flag makes the disconnect visible to the trading gate.
+        """
+        age = (datetime.now() - self._last_live_fetch).total_seconds()
+        return age > self._stale_block_sec
+
+    def _cached(self, key: str, func, ttl=None):
+        """Thread-safe cache with per-timeframe TTL and stale-data tracking (FIX ④)."""
+        now = datetime.now()
+        if ttl is None:
+            ttl = self._cache_ttl_sec
+            for tf, tf_ttl in MT5DataLayer._TF_TTL.items():
+                if f"_{tf}_" in key:
+                    ttl = tf_ttl
+                    break
+        with self._lock:
+            if key in self._cache:
+                ts, val = self._cache[key]
+                if (now - ts).total_seconds() < ttl:
+                    return val
+        # Fetch outside lock to avoid blocking other reads
+        val = func()
+        if val is not None:
+            # MT5 is alive — update last-live timestamp and cache the fresh value
+            self._last_live_fetch = datetime.now()
+            with self._lock:
+                self._cache[key] = (now, val)
+            return val
+        else:
+            # MT5 returned None (disconnected or no data).
+            # Keep the previous valid cache entry so nothing downstream crashes,
+            # but do NOT refresh _last_live_fetch so is_data_stale() will fire.
+            with self._lock:
+                if key in self._cache:
+                    old_ts, old_val = self._cache[key]
+                    age = (now - old_ts).total_seconds()
+                    log.warning("⚠️  MT5 data fetch returned None — serving stale cache "
+                                "[key=%s age=%.0fs]", key, age)
+                    return old_val
+            return None
+
+    def get_rates(self, symbol: str, timeframe: int, count: int = 300) -> Optional[pd.DataFrame]:
+        def fetch():
+            rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+            if rates is None or len(rates) == 0:
+                return None
+            df = pd.DataFrame(rates)
+            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+            df.set_index('time', inplace=True)
+            return df
+        return self._cached(f"rates_{symbol}_{timeframe}_{count}", fetch, ttl=5)
+
+    def get_ticks(self, symbol: str, count: int = 1000) -> Optional[pd.DataFrame]:
+        def fetch():
+            utc_from = datetime.now(tz=timezone.utc) - timedelta(minutes=10)
+            ticks    = mt5.copy_ticks_from(symbol, utc_from, count, mt5.COPY_TICKS_TRADE)
+            if ticks is None or len(ticks) == 0:
+                return None
+            df = pd.DataFrame(ticks)
+            df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+            return df
+        return self._cached(f"ticks_{symbol}", fetch, ttl=2)
+
+    def get_tick(self, symbol: str):
+        return mt5.symbol_info_tick(symbol)
+
+    def get_spread_pips(self, symbol: str) -> float:
+        """Spread in pips with full error/NaN protection"""
+        try:
+            info = mt5.symbol_info(symbol)
+            tick = mt5.symbol_info_tick(symbol)
+            if info is None or tick is None:
+                return 0.0   # unknown spread → don't block trading
+            ask = tick.ask
+            bid = tick.bid
+            if ask <= 0 or bid <= 0 or ask <= bid:
+                return 0.0
+            digits   = info.digits
+            pip_size = 10 ** (-digits + 1) if digits in (3, 5) else 10 ** (-digits)
+            if pip_size <= 0:
+                return 0.0
+            spread_pips = (ask - bid) / pip_size
+            return 0.0 if np.isnan(spread_pips) else max(0.0, spread_pips)
+        except Exception:
+            return 0.0
+
+    def get_pip_size(self, symbol: str) -> float:
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            return 0.0001
+        d = info.digits
+        return 10 ** (-d + 1) if d in (3, 5) else 10 ** (-d)
+
+    def get_point(self, symbol: str) -> float:
+        info = mt5.symbol_info(symbol)
+        return info.point if info else 0.00001
+
+    def get_positions(self, magic: int, symbol: str) -> list:
+        pos = mt5.positions_get(symbol=symbol)
+        if pos is None:
+            return []
+        return [p for p in pos if p.magic == magic]
+
+    def get_account_info(self) -> dict:
+        acc = mt5.account_info()
+        if acc is None:
+            return {"balance": 0, "equity": 0, "free_margin": 0}
+        return {"balance": acc.balance, "equity": acc.equity, "free_margin": acc.margin_free}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 6 — TRADE EXECUTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TradeExecutor:
+    """Handles all trade execution and position management"""
+
+    def __init__(self, cfg: Config, data: MT5DataLayer):
+        self.cfg    = cfg
+        self.data   = data
+        self._partial_done:  Dict[int, bool] = {}   # ticket → partial close done
+        self._partial_times: Dict[int, datetime] = {}  # ticket → time of partial
+
+    def open_trade(self, symbol: str, direction: TradeDirection,
+                   lot: float, sl: float, tp: float, comment: str) -> Optional[int]:
+        """Open a market order. Returns ticket or None."""
+        tick   = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            log.error("Cannot get tick for %s", symbol)
+            return None
+
+        price  = tick.ask if direction == TradeDirection.BUY else tick.bid
+        o_type = mt5.ORDER_TYPE_BUY if direction == TradeDirection.BUY else mt5.ORDER_TYPE_SELL
+
+        # Validate levels
+        if direction == TradeDirection.BUY and (sl >= price or tp <= price):
+            log.warning("BUY levels invalid: price=%.5f SL=%.5f TP=%.5f", price, sl, tp)
+            return None
+        if direction == TradeDirection.SELL and (sl <= price or tp >= price):
+            log.warning("SELL levels invalid: price=%.5f SL=%.5f TP=%.5f", price, sl, tp)
+            return None
+
+        request = {
+            "action":      mt5.TRADE_ACTION_DEAL,
+            "symbol":      symbol,
+            "volume":      lot,
+            "type":        o_type,
+            "price":       price,
+            "sl":          sl,
+            "tp":          tp,
+            "deviation":   self.cfg.MAX_SLIPPAGE,
+            "magic":       self.cfg.MAGIC,
+            "comment":     comment,
+            "type_time":   mt5.ORDER_TIME_GTC,
+            "type_filling":mt5.ORDER_FILLING_FOK,
+        }
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            code = result.retcode if result else "N/A"
+            log.error("Trade FAILED retcode=%s dir=%s lot=%.2f", code, direction.name, lot)
+            return None
+
+        log.info("✅ TRADE OPENED | %s %s | Lot:%.2f SL:%.5f TP:%.5f | %s",
+                 symbol, direction.name, lot, sl, tp, comment)
+        return result.order
+
+    def modify_position(self, ticket: int, sl: float, tp: float) -> bool:
+        request = {
+            "action":   mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "sl":       sl,
+            "tp":       tp,
+        }
+        result = mt5.order_send(request)
+        return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+
+    def close_partial(self, position, close_pct: float) -> bool:
+        """Close a percentage of a position"""
+        info  = mt5.symbol_info(position.symbol)
+        if info is None:
+            return False
+
+        lot_step = info.volume_step
+        close_vol = max(info.volume_min,
+                        round(position.volume * close_pct / 100.0 / lot_step) * lot_step)
+        if close_vol >= position.volume:
+            return False
+
+        tick   = mt5.symbol_info_tick(position.symbol)
+        price  = tick.bid if position.type == mt5.POSITION_TYPE_BUY else tick.ask
+        o_type = mt5.ORDER_TYPE_SELL if position.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+
+        request = {
+            "action":      mt5.TRADE_ACTION_DEAL,
+            "symbol":      position.symbol,
+            "volume":      close_vol,
+            "type":        o_type,
+            "position":    position.ticket,
+            "price":       price,
+            "deviation":   self.cfg.MAX_SLIPPAGE,
+            "magic":       self.cfg.MAGIC,
+            "comment":     "IAE_v5_partial",
+            "type_time":   mt5.ORDER_TIME_GTC,
+            "type_filling":mt5.ORDER_FILLING_FOK,
+        }
+        result = mt5.order_send(request)
+        ok     = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+        if ok:
+            log.info("✂️ Partial close %.0f%% of ticket %d", close_pct, position.ticket)
+        return ok
+
+    def close_position(self, position) -> bool:
+        tick   = mt5.symbol_info_tick(position.symbol)
+        price  = tick.bid if position.type == mt5.POSITION_TYPE_BUY else tick.ask
+        o_type = mt5.ORDER_TYPE_SELL if position.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+
+        request = {
+            "action":      mt5.TRADE_ACTION_DEAL,
+            "symbol":      position.symbol,
+            "volume":      position.volume,
+            "type":        o_type,
+            "position":    position.ticket,
+            "price":       price,
+            "deviation":   self.cfg.MAX_SLIPPAGE,
+            "magic":       self.cfg.MAGIC,
+            "comment":     "IAE_v5_close",
+            "type_filling":mt5.ORDER_FILLING_FOK,
+        }
+        result = mt5.order_send(request)
+        return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+
+    def calculate_lot_e1(self, symbol: str, sl_pips: float) -> float:
+        """
+        Risk-based lot size for Engine 1.
+        FIX: Full validation chain — never return 0 or sub-minimum lot.
+        """
+        try:
+            info = mt5.symbol_info(symbol)
+            if info is None:
+                return self.cfg.FIXED_LOT
+
+            vol_min  = info.volume_min
+            vol_max  = info.volume_max
+            vol_step = info.volume_step
+
+            if sl_pips <= 0:
+                return vol_min
+
+            acc = mt5.account_info()
+            if acc is None or acc.balance <= 0:
+                return vol_min
+
+            risk_amount = acc.balance * self.cfg.RISK_PCT / 100.0
+            tick_value  = info.trade_tick_value
+            tick_size   = info.trade_tick_size
+            pip_size    = self.data.get_pip_size(symbol)
+
+            if tick_size <= 0 or tick_value <= 0 or pip_size <= 0:
+                return vol_min
+
+            # Core lot formula
+            lot = risk_amount / (sl_pips * pip_size / tick_size * tick_value)
+
+            if not np.isfinite(lot) or lot <= 0:
+                return vol_min
+
+            # Snap to valid step and clamp to broker limits
+            lot = max(vol_min, min(vol_max,
+                      round(lot / vol_step) * vol_step))
+            # Final NaN/inf guard
+            return float(lot) if np.isfinite(lot) else float(vol_min)
+
+        except Exception as e:
+            log.debug("calculate_lot_e1 error: %s", e)
+            info = mt5.symbol_info(symbol)
+            return float(info.volume_min) if info else self.cfg.FIXED_LOT
+
+    def is_partial_done(self, ticket: int) -> bool:
+        return self._partial_done.get(ticket, False)
+
+    def mark_partial_done(self, ticket: int):
+        self._partial_done[ticket]  = True
+        self._partial_times[ticket] = datetime.now(timezone.utc)
+        # Cleanup entries older than 24 hours to prevent memory leak
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        expired = [t for t, dt in self._partial_times.items() if dt < cutoff]
+        for t in expired:
+            self._partial_done.pop(t, None)
+            self._partial_times.pop(t, None)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7 — ENGINE 1: SMC KILL ZONE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SMCKillZoneEngine:
+    """
+    Engine 1: Institutional SMC logic for London/NY Kill Zones.
+    Evaluates ALL conditions for display ALWAYS.
+    Only sets direction != NONE when all execution gates pass.
+    """
+
+    def __init__(self, cfg: Config, data: MT5DataLayer, executor: TradeExecutor):
+        self.cfg  = cfg
+        self.data = data
+        self.exe  = executor
+        self.vp   = VolumeProfileResult()
+        self._bull_ob: List[OrderBlock] = []
+        self._bear_ob: List[OrderBlock] = []
+        self._bull_fvg: List[FairValueGap] = []
+        self._bear_fvg: List[FairValueGap] = []
+        self._nearest_ob_dist: float = 0.0
+        self._nearest_ob_str:  float = 0.0
+
+    # ── Market Structure ────────────────────────────────────────────────────
+
+    def detect_bias(self, timeframe: int, lookback: int = 30) -> MarketBias:
+        df = self.data.get_rates(self.cfg.SYMBOL, timeframe, lookback + 5)
+        if df is None or len(df) < lookback:
+            return MarketBias.UNKNOWN
+        hi = df['high'].values[::-1]
+        lo = df['low'].values[::-1]
+        hh, hl, ll, lh = 0, 0, 0, 0
+        prev_h, prev_l = -np.inf, np.inf
+        last_was_high  = False
+        for i in range(2, lookback - 2):
+            is_swH = hi[i] > hi[i-1] and hi[i] > hi[i+1] and hi[i] > hi[i-2] and hi[i] > hi[i+2]
+            is_swL = lo[i] < lo[i-1] and lo[i] < lo[i+1] and lo[i] < lo[i-2] and lo[i] < lo[i+2]
+            if is_swH and not last_was_high:
+                hh += (1 if hi[i] > prev_h else 0)
+                lh += (1 if hi[i] <= prev_h else 0)
+                prev_h, last_was_high = hi[i], True
+            if is_swL and last_was_high:
+                hl += (1 if lo[i] > prev_l else 0)
+                ll += (1 if lo[i] <= prev_l else 0)
+                prev_l, last_was_high = lo[i], False
+        if hh >= 2 and hl >= 1:
+            return MarketBias.BULL
+        if ll >= 2 and lh >= 1:
+            return MarketBias.BEAR
+        return MarketBias.RANGING
+
+    # ── Order Block Detection (IMPROVED v5.1) ──────────────────────────────
+
+    def scan_order_blocks(self, bias: MarketBias):
+        """
+        IMPROVED: Dual-TF OB scan with Age/Freshness filter.
+        - Only accepts OBs aged between OB_MIN_AGE_BARS and OB_MAX_AGE_BARS
+        - Checks if OB has been mitigated (touched) since formation
+        - Premium/Discount zone classification
+        - Tighter proximity buffer
+        """
+        self._bull_ob, self._bear_ob = [], []
+
+        tick = mt5.symbol_info_tick(self.cfg.SYMBOL)
+        if tick is None:
+            return
+        cur = tick.bid
+        pip = self.data.get_pip_size(self.cfg.SYMBOL)
+        atr = self._get_atr()
+        if atr <= 0:
+            return
+
+        # Get current bar index for age calculation
+        cur_time = datetime.now(timezone.utc)
+
+        # Scan both HTF (H1) and ENTRY_TF (M5)
+        for tf in [self.cfg.HTF_TF, self.cfg.ENTRY_TF]:
+            df = self.data.get_rates(self.cfg.SYMBOL, tf, self.cfg.OB_LOOKBACK + 5)
+            if df is None or len(df) < 5:
+                continue
+
+            op  = df['open'].values[::-1]
+            hi  = df['high'].values[::-1]
+            lo  = df['low'].values[::-1]
+            cl  = df['close'].values[::-1]
+            vol = df['tick_volume'].values[::-1]
+            times = df.index.tolist()[::-1]  # Convert to list for reverse indexing
+
+            # Derive a per-TF ATR so H1 and M5 use appropriate volatility scale
+            df_atr = self.data.get_rates(self.cfg.SYMBOL, tf, self.cfg.ATR_PERIOD * 4)
+            if df_atr is not None and len(df_atr) >= self.cfg.ATR_PERIOD * 2:
+                atr_series = Indicators.atr(
+                    df_atr['high'], df_atr['low'], df_atr['close'],
+                    self.cfg.ATR_PERIOD
+                ).dropna()
+                tf_atr = float(atr_series.iloc[-1]) if len(atr_series) > 0 else atr
+                if not np.isfinite(tf_atr) or tf_atr <= 0:
+                    tf_atr = atr
+            else:
+                tf_atr = atr
+
+            safe_limit = min(
+                self.cfg.OB_LOOKBACK,
+                len(op) - 2,
+                len(hi) - 2,
+                len(lo) - 2,
+                len(cl) - 2,
+                len(vol) - 2,
+                len(times) - 2
+            )
+
+            for i in range(2, safe_limit):
+                impulse    = hi[i-1] - lo[i-1]
+                is_impulse = impulse >= 1.0 * tf_atr
+
+                # Calculate OB age in bars
+                ob_time = times[i]
+                if isinstance(ob_time, str):
+                    ob_time = pd.to_datetime(ob_time)
+                # Approximate age: bars since OB formation
+                ob_age = i
+
+                # ── AGE FILTER: Skip if OB is too fresh or too old ──────────
+                if ob_age < self.cfg.OB_MIN_AGE_BARS:
+                    continue  # Too fresh - institutional hasn't had time to leave
+                if ob_age > self.cfg.OB_MAX_AGE_BARS:
+                    continue  # Too old - OB is no longer relevant
+
+                # ── Check if OB is MITIGATED (touched since formation) ──────
+                # For bullish OB: price has moved above the OB high
+                # For bearish OB: price has moved below the OB low
+                is_fresh_bull = cur >= lo[i]  # Price at or above bullish OB
+                is_fresh_bear = cur <= hi[i]  # Price at or below bearish OB
+
+                # ── Bullish OB: bearish candle[i] + bullish impulse at [i-1] ──
+                if (cl[i] < op[i] and cl[i-1] > op[i-1]
+                        and is_impulse and is_fresh_bull):
+                    vol_avg  = np.mean(vol[i:min(i+10, len(vol))]) or 1.0
+                    vr       = min(vol[i-1] / vol_avg, 4.0)
+                    bs       = (bias == MarketBias.BULL)
+                    
+                    # Age-based strength bonus (younger = stronger)
+                    age_factor = max(0.5, 1.0 - (ob_age - self.cfg.OB_MIN_AGE_BARS) / 30.0)
+                    
+                    strength = min(100.0,
+                        40.0 * min(impulse / (tf_atr + 1e-10), 2.5) / 2.5 * age_factor +
+                        35.0 * min(vr, 2.0) / 2.0 +
+                        25.0 * (1.0 if bs else 0.3))
+                    
+                    # Dedup: skip if an OB with same zone already recorded
+                    is_dup = any(
+                        abs(ob.hi - hi[i]) < pip * 2
+                        for ob in self._bull_ob
+                    )
+                    if not is_dup:
+                        bar_idx = min(1 + i, len(df.index) - 1)
+                        ob = OrderBlock(
+                            hi=hi[i], lo=lo[i],
+                            time=df.index[-bar_idx],
+                            is_bull=True,
+                            strength=strength
+                        )
+                        # Mark as fresh
+                        ob.is_valid = True
+                        self._bull_ob.append(ob)
+
+                # ── Bearish OB: bullish candle[i] + bearish impulse at [i-1] ─
+                if (cl[i] > op[i] and cl[i-1] < op[i-1]
+                        and is_impulse and is_fresh_bear):
+                    vol_avg  = np.mean(vol[i:min(i+10, len(vol))]) or 1.0
+                    vr       = min(vol[i-1] / vol_avg, 4.0)
+                    bs       = (bias == MarketBias.BEAR)
+                    
+                    # Age-based strength bonus (younger = stronger)
+                    age_factor = max(0.5, 1.0 - (ob_age - self.cfg.OB_MIN_AGE_BARS) / 30.0)
+                    
+                    strength = min(100.0,
+                        40.0 * min(impulse / (tf_atr + 1e-10), 2.5) / 2.5 * age_factor +
+                        35.0 * min(vr, 2.0) / 2.0 +
+                        25.0 * (1.0 if bs else 0.3))
+                    
+                    is_dup = any(
+                        abs(ob.lo - lo[i]) < pip * 2
+                        for ob in self._bear_ob
+                    )
+                    if not is_dup:
+                        bar_idx = min(1 + i, len(df.index) - 1)
+                        ob = OrderBlock(
+                            hi=hi[i], lo=lo[i],
+                            time=df.index[-bar_idx],
+                            is_bull=False,
+                            strength=strength
+                        )
+                        # Mark as fresh
+                        ob.is_valid = True
+                        self._bear_ob.append(ob)
+
+        # Sort by most recent formation time (index 0 = newest)
+        self._bull_ob.sort(key=lambda x: x.time, reverse=True)
+        self._bear_ob.sort(key=lambda x: x.time, reverse=True)
+
+    def price_at_ob(self, is_bull: bool) -> Tuple[float, int, bool]:
+        """
+        IMPROVED v5.1: Tighter proximity buffer (10 pips).
+        Returns: (strength, age_bars, is_fresh)
+        """
+        tick = mt5.symbol_info_tick(self.cfg.SYMBOL)
+        if tick is None:
+            return (0.0, 0, False)
+        price  = tick.bid
+        pip    = self.data.get_pip_size(self.cfg.SYMBOL)
+        # Tighter 10-pip buffer (was 20) for better entry precision
+        buf    = self.cfg.OB_PRICE_BUFFER_PIPS * pip
+        source = self._bull_ob if is_bull else self._bear_ob
+
+        # Store nearest OB for dashboard display
+        nearest_dist = float('inf')
+        nearest_str  = 0.0
+        best_ob = None
+
+        for ob in source:
+            if not ob.is_valid:
+                continue
+            # Check if price is within buffer of OB zone
+            if ob.lo - buf <= price <= ob.hi + buf:
+                if best_ob is None or ob.strength > best_ob.strength:
+                    best_ob = ob
+            # Track nearest OB even if not at it
+            if is_bull:
+                dist = (ob.hi - price) / pip  # How far below OB high
+            else:
+                dist = (price - ob.lo) / pip  # How far above OB low
+            if 0 < dist < nearest_dist:
+                nearest_dist = dist
+                nearest_str  = ob.strength
+
+        # Store nearest OB info as instance variable for display
+        self._nearest_ob_dist  = nearest_dist if nearest_dist < float('inf') else 0.0
+        self._nearest_ob_str   = nearest_str
+        
+        if best_ob is not None:
+            # Estimate age from OB strength (higher strength = younger)
+            estimated_age = int((100 - best_ob.strength) / 10)
+            return (best_ob.strength, estimated_age, True)
+        
+        return (0.0, 0, False)  # Not at OB yet
+
+    def get_nearest_ob_info(self) -> str:
+        """Returns human-readable nearest OB info for dashboard"""
+        dist = getattr(self, '_nearest_ob_dist', 0.0)
+        str_ = getattr(self, '_nearest_ob_str',  0.0)
+        if dist <= 0 or str_ <= 0:
+            return "No OB found"
+        return f"{dist:.1f} pip away | Str:{str_:.0f}%"
+
+    # ── Fair Value Gap Detection (IMPROVED v5.1) ─────────────────────────
+
+    def scan_fvgs(self):
+        """
+        IMPROVED v5.1: FVG with age and mitigation check.
+        - Only accepts FVGs within FVG_MAX_AGE_BARS
+        - Checks if FVG is NOT fully mitigated
+        - Requires price to be RETESTING the FVG zone
+        """
+        df  = self.data.get_rates(self.cfg.SYMBOL, self.cfg.FVG_TF, 
+                                   self.cfg.FVG_MAX_AGE_BARS + 20)
+        if df is None:
+            return
+        self._bull_fvg, self._bear_fvg = [], []
+        hi   = df['high'].values[::-1]
+        lo   = df['low'].values[::-1]
+        cl   = df['close'].values[::-1]
+        cur  = mt5.symbol_info_tick(self.cfg.SYMBOL).bid
+        pip  = self.data.get_pip_size(self.cfg.SYMBOL)
+        min_pts = self.cfg.FVG_MIN_PIPS * pip
+        max_age = self.cfg.FVG_MAX_AGE_BARS
+
+        for i in range(2, min(max_age + 5, len(hi) - 2)):
+            # Skip if too old
+            if i > max_age:
+                continue
+            
+            # Bullish FVG: lo[i-2] > hi[i] (gap between candle i-2 and candle i)
+            if lo[i-2] > hi[i] and (lo[i-2] - hi[i]) >= min_pts:
+                gap_size = (lo[i-2] - hi[i]) / pip
+                
+                # IMPROVED: Price must be RETESTING the gap (between the two candles)
+                # AND must not have fully filled the gap
+                fvg_mid = (lo[i-2] + hi[i]) / 2
+                is_retesting = cur <= lo[i-2] and cur >= hi[i]  # Price is inside the gap
+                is_not_filled = cur > hi[i]  # Price hasn't dropped below the gap
+                
+                # For bullish FVG: price should be above the lower candle high
+                # and retesting the gap from above
+                if is_retesting and is_not_filled:
+                    self._bull_fvg.append(FairValueGap(
+                        hi=lo[i-2], lo=hi[i], time=df.index[-1-i],
+                        is_bull=True, size_pips=gap_size))
+            
+            # Bearish FVG: hi[i-2] < lo[i]
+            if hi[i-2] < lo[i] and (lo[i] - hi[i-2]) >= min_pts:
+                gap_size = (lo[i] - hi[i-2]) / pip
+                
+                # Price must be RETESTING the gap
+                is_retesting = cur >= hi[i-2] and cur <= lo[i]  # Price is inside the gap
+                is_not_filled = cur < lo[i]  # Price hasn't risen above the gap
+                
+                if is_retesting and is_not_filled:
+                    self._bear_fvg.append(FairValueGap(
+                        hi=lo[i], lo=hi[i-2], time=df.index[-1-i],
+                        is_bull=False, size_pips=gap_size))
+
+    def price_in_fvg(self, is_bull: bool) -> bool:
+        """
+        IMPROVED v5.1: Check if price is retesting FVG zone.
+        """
+        price  = mt5.symbol_info_tick(self.cfg.SYMBOL).bid
+        source = self._bull_fvg if is_bull else self._bear_fvg
+        
+        for f in source:
+            # Price should be within the FVG zone (retesting)
+            if f.lo <= price <= f.hi:
+                return True
+        return False
+
+    # ── Volume Spike ────────────────────────────────────────────────────────
+
+    def check_volume_spike(self) -> bool:
+        """
+        IMPROVED v5.1: Volume spike with higher threshold (1.5x).
+        """
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF, self.cfg.VOL_MA_PERIOD + 5)
+        if df is None or len(df) < self.cfg.VOL_MA_PERIOD + 1:
+            return False
+        vol    = df['tick_volume'].values[::-1]
+        sma    = np.mean(vol[1:self.cfg.VOL_MA_PERIOD + 1])
+        return sma > 0 and vol[0] / sma >= self.cfg.VOL_SPIKE_MULT
+
+    # ════════════════════════════════════════════════════════════════════════════
+    #  NEW ICT CONCEPTS (v5.1) — INSTITUTIONAL ENHANCEMENTS
+    # ════════════════════════════════════════════════════════════════════════════
+
+    # ── Displacement Detection (NEW) ─────────────────────────────────────────
+    def detect_displacement(self, is_bull: bool) -> DisplacementEvent:
+        """
+        DISPLACEMENT = When a candle engulfs 2+ previous candles with volume spike.
+        This is a key ICT concept showing institutional involvement.
+        
+        Requirements:
+        1. Current candle engulfs at least 2 previous candles
+        2. Volume at displacement must be > 1.5x average
+        3. Displacement direction matches trade direction
+        """
+        ev = DisplacementEvent()
+        
+        if not self.cfg.USE_DISPLACEMENT:
+            ev.detected = True  # Disabled = always pass
+            return ev
+        
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF, 
+                                  self.cfg.DISP_LOOKBACK + 10)
+        if df is None or len(df) < self.cfg.DISP_LOOKBACK:
+            ev.detected = True  # No data = fail open
+            return ev
+
+        op   = df['open'].values[::-1]
+        hi   = df['high'].values[::-1]
+        lo   = df['low'].values[::-1]
+        cl   = df['close'].values[::-1]
+        vol  = df['tick_volume'].values[::-1]
+        vol_avg = np.mean(vol[1:20]) if len(vol) > 20 else np.mean(vol[1:])
+        
+        if vol_avg <= 0:
+            ev.detected = True
+            return ev
+        
+        pip = self.data.get_pip_size(self.cfg.SYMBOL)
+        
+        # Check displacement in last 5 bars
+        for i in range(1, min(6, len(op))):
+            disp_bar = op[i], hi[i], lo[i], cl[i]
+            vol_ratio = vol[i] / vol_avg
+            
+            # Minimum volume requirement
+            if vol_ratio < self.cfg.DISP_MIN_VOL_MULT:
+                continue
+            
+            # Bullish Displacement: candle engulfs previous bars
+            if is_bull:
+                min_bars = self.cfg.DISP_MIN_BARS
+                if i + min_bars < len(op):
+                    # Check if this candle engulfs the previous min_bars candles
+                    prev_hi = max(hi[i+1:i+1+min_bars])
+                    prev_lo = min(lo[i+1:i+1+min_bars])
+                    prev_op = op[i+1]
+                    prev_cl = cl[i+1]
+                    
+                    # Bullish engulfing with volume
+                    if (cl[i] > prev_hi and op[i] < prev_lo and 
+                        cl[i] > prev_op and vol_ratio >= self.cfg.DISP_MIN_VOL_MULT):
+                        ev.detected = True
+                        ev.direction = TradeDirection.BUY
+                        ev.engulf_bars = min_bars
+                        ev.displacement_pips = (hi[i] - lo[i]) / pip
+                        ev.volume_ratio = vol_ratio
+                        ev.time = df.index[-1-i]
+                        return ev
+            
+            # Bearish Displacement
+            else:
+                min_bars = self.cfg.DISP_MIN_BARS
+                if i + min_bars < len(op):
+                    prev_hi = max(hi[i+1:i+1+min_bars])
+                    prev_lo = min(lo[i+1:i+1+min_bars])
+                    prev_op = op[i+1]
+                    prev_cl = cl[i+1]
+                    
+                    # Bearish engulfing with volume
+                    if (cl[i] < prev_lo and op[i] > prev_hi and 
+                        cl[i] < prev_op and vol_ratio >= self.cfg.DISP_MIN_VOL_MULT):
+                        ev.detected = True
+                        ev.direction = TradeDirection.SELL
+                        ev.engulf_bars = min_bars
+                        ev.displacement_pips = (hi[i] - lo[i]) / pip
+                        ev.volume_ratio = vol_ratio
+                        ev.time = df.index[-1-i]
+                        return ev
+        
+        # No displacement found - fail open (don't block trades)
+        ev.detected = True
+        return ev
+
+    # ── Breaker Block Detection (NEW) ──────────────────────────────────────
+    def detect_breaker_block(self, is_bull: bool) -> Tuple[bool, float]:
+        """
+        BREAKER BLOCK = When previous structure (swing high/low) breaks
+        and price returns to test the broken level as new support/resistance.
+        
+        For Bullish trade:
+        1. Find recent swing low
+        2. Price breaks below it (liquidity sweep)
+        3. Price returns UP to test the broken level
+        4. That return zone = Bullish Breaker Block
+        
+        For Bearish trade:
+        1. Find recent swing high
+        2. Price breaks above it (liquidity sweep)
+        3. Price returns DOWN to test the broken level
+        4. That return zone = Bearish Breaker Block
+        """
+        if not self.cfg.USE_BREAKER_BLOCK:
+            return (True, 0.0)  # Disabled = always pass
+        
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF, 
+                                  self.cfg.BB_LOOKBACK + 10)
+        if df is None or len(df) < 20:
+            return (True, 0.0)
+        
+        hi   = df['high'].values[::-1]
+        lo   = df['low'].values[::-1]
+        cl   = df['close'].values[::-1]
+        pip  = self.data.get_pip_size(self.cfg.SYMBOL)
+        cur  = mt5.symbol_info_tick(self.cfg.SYMBOL).bid
+        
+        # Find recent swing points
+        swing_highs = []
+        swing_lows = []
+        for i in range(3, len(hi) - 3):
+            if hi[i] > hi[i-1] and hi[i] > hi[i+1] and hi[i] > hi[i-2] and hi[i] > hi[i+2]:
+                swing_highs.append((i, hi[i]))
+            if lo[i] < lo[i-1] and lo[i] < lo[i+1] and lo[i] < lo[i-2] and lo[i] < lo[i+2]:
+                swing_lows.append((i, lo[i]))
+        
+        if is_bull:
+            # Look for: Swing low was broken, then price returned UP
+            for i, sl_price in swing_lows[:5]:  # Check recent swing lows
+                # Was this level broken?
+                broken = any(lo[j] < sl_price for j in range(1, i))
+                # Has price returned to test it?
+                returned = any(abs(cl[j] - sl_price) < 5 * pip for j in range(1, i))
+                if broken and returned:
+                    # Calculate breaker block strength
+                    dist_from_cur = (sl_price - cur) / pip if sl_price > cur else 0
+                    if 0 < dist_from_cur < 30:  # Within 30 pips
+                        strength = min(100, 50 + 30 * (1 - dist_from_cur/30))
+                        return (True, strength)
+            return (False, 0.0)
+        else:
+            # Look for: Swing high was broken, then price returned DOWN
+            for i, sh_price in swing_highs[:5]:  # Check recent swing highs
+                broken = any(hi[j] > sh_price for j in range(1, i))
+                returned = any(abs(cl[j] - sh_price) < 5 * pip for j in range(1, i))
+                if broken and returned:
+                    dist_from_cur = (cur - sh_price) / pip if cur > sh_price else 0
+                    if 0 < dist_from_cur < 30:
+                        strength = min(100, 50 + 30 * (1 - dist_from_cur/30))
+                        return (True, strength)
+            return (False, 0.0)
+
+    # ── Volume Absorption Detection (NEW) ───────────────────────────────────
+    def check_absorption(self, is_bull: bool) -> AbsorptionResult:
+        """
+        ABSORPTION = When institutions absorb selling/buying pressure at a level,
+        showing up as abnormally high volume without proportional price move.
+        
+        This often happens right before a breakout or reversal.
+        """
+        result = AbsorptionResult(detected=True)  # Default: pass
+        
+        if not self.cfg.USE_ABSORPTION:
+            return result
+        
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF,
+                                  self.cfg.ABSORPTION_LOOKBACK + 10)
+        if df is None or len(df) < self.cfg.ABSORPTION_LOOKBACK:
+            return result
+        
+        hi   = df['high'].values[::-1]
+        lo   = df['low'].values[::-1]
+        cl   = df['close'].values[::-1]
+        vol  = df['tick_volume'].values[::-1]
+        
+        vol_avg = np.mean(vol[5:]) if len(vol) > 5 else np.mean(vol)
+        if vol_avg <= 0:
+            return result
+        
+        pip = self.data.get_pip_size(self.cfg.SYMBOL)
+        
+        # Look for absorption pattern in recent bars
+        for i in range(1, min(10, len(hi))):
+            vol_ratio = vol[i] / vol_avg
+            
+            # High volume but small price move = absorption
+            price_range = (hi[i] - lo[i]) / pip
+            if vol_ratio >= self.cfg.ABSORPTION_VOL_MULT and price_range < 5:
+                # Absorbed selling (bullish sign)
+                if is_bull and vol_ratio >= self.cfg.ABSORPTION_VOL_MULT * 1.5:
+                    result.detected = True
+                    result.direction = TradeDirection.BUY
+                    result.absorption_price = (hi[i] + lo[i]) / 2
+                    result.volume_ratio = vol_ratio
+                    result.is_fresh = True
+                    return result
+                # Absorbed buying (bearish sign)
+                elif not is_bull and vol_ratio >= self.cfg.ABSORPTION_VOL_MULT * 1.5:
+                    result.detected = True
+                    result.direction = TradeDirection.SELL
+                    result.absorption_price = (hi[i] + lo[i]) / 2
+                    result.volume_ratio = vol_ratio
+                    result.is_fresh = True
+                    return result
+        
+        return result
+
+    # ── Session Momentum Filter (NEW) ───────────────────────────────────────
+    def get_session_momentum(self, is_bull: bool) -> SessionMomentum:
+        """
+        SESSION MOMENTUM = First 30 min (6 bars of M5) bias detection.
+        
+        If we're in Kill Zone, the first 30 min direction often shows
+        where institutions want to take price.
+        
+        Returns momentum direction and strength.
+        """
+        sm = SessionMomentum()
+        
+        # Get bars for first 30 min of session
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF,
+                                  self.cfg.SESSION_MOMENTUM_BARS + 5)
+        if df is None or len(df) < self.cfg.SESSION_MOMENTUM_BARS:
+            sm.direction = TradeDirection.NONE
+            return sm
+        
+        # Analyze first 6 M5 candles (30 min)
+        bars = df.tail(self.cfg.SESSION_MOMENTUM_BARS)
+        
+        bull_bars = 0
+        bear_bars = 0
+        
+        for _, row in bars.iterrows():
+            if row['close'] > row['open']:
+                bull_bars += 1
+            elif row['close'] < row['open']:
+                bear_bars += 1
+        
+        total = bull_bars + bear_bars
+        if total == 0:
+            sm.direction = TradeDirection.NONE
+            return sm
+        
+        # Determine momentum direction
+        if bull_bars > bear_bars:
+            sm.direction = TradeDirection.BUY
+            sm.consecutive_bars = bull_bars
+        elif bear_bars > bull_bars:
+            sm.direction = TradeDirection.SELL
+            sm.consecutive_bars = bear_bars
+        else:
+            sm.direction = TradeDirection.NONE
+        
+        sm.total_bars = total
+        sm.strength = (abs(bull_bars - bear_bars) / total) * 100
+        
+        return sm
+
+    # ── Liquidity Sweep Quality Check (NEW) ────────────────────────────────
+    def check_sweep_quality(self, is_bull: bool) -> bool:
+        """
+        QUALITY SWEEP = When liquidity is swept, price must:
+        1. Reverse quickly (within LIQ_REVERSAL_BARS)
+        2. Show volume spike at the sweep
+        3. Form a rejection candle
+        
+        This filters out "failed sweeps" that continue in the sweep direction.
+        """
+        if not self.cfg.LIQ_SWEEP_QUALITY:
+            return True  # Disabled = pass
+        
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF,
+                                  self.cfg.LIQ_REVERSAL_BARS + 10)
+        if df is None or len(df) < self.cfg.LIQ_REVERSAL_BARS + 5:
+            return True
+        
+        hi   = df['high'].values[::-1]
+        lo   = df['low'].values[::-1]
+        cl   = df['close'].values[::-1]
+        op   = df['open'].values[::-1]
+        vol  = df['tick_volume'].values[::-1]
+        vol_avg = np.mean(vol[5:]) if len(vol) > 5 else np.mean(vol)
+        
+        if vol_avg <= 0:
+            return True
+        
+        # Check for sweep and quick reversal
+        for i in range(1, min(self.cfg.LIQ_REVERSAL_BARS + 1, len(hi))):
+            vol_ratio = vol[i] / vol_avg
+            
+            if is_bull:
+                # Low was swept and price reversed up
+                if cl[i] > op[i] and vol_ratio >= self.cfg.LIQ_VOL_CONFIRM:
+                    # Check if there was a sweep before this candle
+                    if i > 1:
+                        prev_lo = min(lo[i+1:min(i+4, len(lo))])
+                        if lo[i-1] < prev_lo:  # Previous bars had lower lows = sweep happened
+                            return True
+            else:
+                # High was swept and price reversed down
+                if cl[i] < op[i] and vol_ratio >= self.cfg.LIQ_VOL_CONFIRM:
+                    if i > 1:
+                        prev_hi = max(hi[i+1:min(i+4, len(hi))])
+                        if hi[i-1] > prev_hi:  # Previous bars had higher highs = sweep happened
+                            return True
+        
+        return True  # No clear sweep = pass (don't block)
+
+    # ── RSI/MACD Divergence ─────────────────────────────────────────────────
+
+    def check_divergence(self, is_bull: bool) -> bool:
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF,
+                                  self.cfg.DIV_LOOKBACK + 10)
+        if df is None or len(df) < self.cfg.DIV_LOOKBACK + 5:
+            return False
+        cl   = df['close']
+        hi   = df['high'].values[::-1]
+        lo   = df['low'].values[::-1]
+        rsi_raw = Indicators.rsi(cl, self.cfg.RSI_PERIOD)
+        rsi_raw = rsi_raw.fillna(50.0)          # NaN → neutral 50
+        rsi  = rsi_raw.values[::-1]
+        _, _, hist = Indicators.macd(cl, self.cfg.MACD_FAST, self.cfg.MACD_SLOW, self.cfg.MACD_SIGNAL)
+        hist = hist.fillna(0.0)                  # NaN → 0
+        macd_h = hist.values[::-1]
+        lb = self.cfg.DIV_LOOKBACK
+
+        if is_bull:
+            # Find two lowest lows
+            l1, l2 = 1, -1
+            for i in range(2, lb):
+                if i < len(lo) and lo[i] < lo[l1]:
+                    l2, l1 = l1, i
+            if l2 < 0 or l2 >= len(rsi) or l1 >= len(rsi):
+                return False
+            return (lo[l1] < lo[l2] and rsi[l1] > rsi[l2] and
+                    len(macd_h) > 3 and macd_h[1] > macd_h[3])
+        else:
+            # Find two highest highs
+            h1, h2 = 1, -1
+            for i in range(2, lb):
+                if i < len(hi) and hi[i] > hi[h1]:
+                    h2, h1 = h1, i
+            if h2 < 0 or h2 >= len(rsi) or h1 >= len(rsi):
+                return False
+            return (hi[h1] > hi[h2] and rsi[h1] < rsi[h2] and
+                    len(macd_h) > 3 and macd_h[1] < macd_h[3])
+
+    # ── ADX ─────────────────────────────────────────────────────────────────
+
+    def _get_adx(self) -> float:
+        """
+        ADX getter: uses ADX_TF (M15 by default) not HTF (H1).
+        H1 only changes every 60 minutes → causes "ADX frozen" in dashboard.
+        M15 changes every 15 minutes → live, responsive ADX readings.
+        """
+        adx_tf      = getattr(self.cfg, 'ADX_TF', mt5.TIMEFRAME_M15)
+        bars_needed = max(self.cfg.ADX_PERIOD * 5, 100)
+        df = self.data.get_rates(self.cfg.SYMBOL, adx_tf, bars_needed)
+        if df is None or len(df) < self.cfg.ADX_PERIOD * 3:
+            return 0.0
+        try:
+            series = Indicators.adx(df['high'], df['low'], df['close'],
+                                     self.cfg.ADX_PERIOD)
+            val = series.iloc[-1]
+            if val is None or (isinstance(val, float) and (np.isnan(val) or np.isinf(val))):
+                return 0.0
+            return max(0.0, float(val))
+        except Exception as e:
+            log.debug("_get_adx error: %s", e)
+            return 0.0
+
+    def _get_atr(self) -> float:
+        """ATR getter: uses ADX_TF (M15) for live ATR — not H1 (frozen)"""
+        adx_tf      = getattr(self.cfg, 'ADX_TF', mt5.TIMEFRAME_M15)
+        bars_needed = max(self.cfg.ATR_PERIOD * 4, 60)
+        df = self.data.get_rates(self.cfg.SYMBOL, adx_tf, bars_needed)
+        if df is None or len(df) < self.cfg.ATR_PERIOD * 2:
+            # Fallback: estimate ATR from recent high-low range
+            df2 = self.data.get_rates(self.cfg.SYMBOL, self.cfg.HTF_TF, 5)
+            if df2 is not None and len(df2) > 0:
+                return float((df2['high'] - df2['low']).mean())
+            return 0.0
+        try:
+            series = Indicators.atr(df['high'], df['low'], df['close'],
+                                     self.cfg.ATR_PERIOD)
+            val = series.iloc[-1]
+            if val is None or (isinstance(val, float) and (np.isnan(val) or np.isinf(val))):
+                # Fallback to simple high-low average
+                return float((df['high'] - df['low']).tail(14).mean())
+            return max(0.0, float(val))
+        except Exception as e:
+            log.debug("_get_atr error: %s", e)
+            return 0.0
+
+    # ── Liquidity Sweep ─────────────────────────────────────────────────────
+
+    def detect_liquidity_sweep(self, is_bull: bool) -> bool:
+        lb  = self.cfg.OB_LOOKBACK // 2
+        df  = self.data.get_rates(self.cfg.SYMBOL, self.cfg.HTF_TF, lb + 5)
+        if df is None or len(df) < lb:
+            return False
+        hi   = df['high'].values[::-1]
+        lo   = df['low'].values[::-1]
+        cl   = df['close'].values[::-1]
+        op   = df['open'].values[::-1]
+        vol  = df['tick_volume'].values[::-1]
+        sweep_bars = 3
+
+        if is_bull:
+            sw_lo = np.min(lo[sweep_bars+1:lb])
+            for j in range(1, sweep_bars+1):
+                if j >= len(lo):
+                    break
+                vol_avg = np.mean(vol[j+1:min(j+11, len(vol))])
+                if (lo[j] < sw_lo and cl[j] > sw_lo and
+                        cl[j] > op[j] and vol_avg > 0 and vol[j] > 1.3 * vol_avg):
+                    return True
+        else:
+            sw_hi = np.max(hi[sweep_bars+1:lb])
+            for j in range(1, sweep_bars+1):
+                if j >= len(hi):
+                    break
+                vol_avg = np.mean(vol[j+1:min(j+11, len(vol))])
+                if (hi[j] > sw_hi and cl[j] < sw_hi and
+                        cl[j] < op[j] and vol_avg > 0 and vol[j] > 1.3 * vol_avg):
+                    return True
+        return False
+
+    # ── MSS Detection ───────────────────────────────────────────────────────
+
+    def detect_mss(self, is_bull: bool) -> bool:
+        """
+        Market Structure Shift detection.
+        FIX: Allow 2-bar window for MSS confirmation (not just exact 1-bar crossover).
+        Also check M1 for faster signal when M5 bar not yet closed.
+        """
+        confirmed = self._check_mss_on_tf(self.cfg.ENTRY_TF, is_bull, lookback=20)
+        if confirmed:
+            return True
+        # Secondary check: M1 for faster confirmation
+        return self._check_mss_on_tf(mt5.TIMEFRAME_M1, is_bull, lookback=30)
+
+    def _check_mss_on_tf(self, tf: int, is_bull: bool, lookback: int = 20) -> bool:
+        df = self.data.get_rates(self.cfg.SYMBOL, tf, lookback + 5)
+        if df is None or len(df) < 10:
+            return False
+        hi = df['high'].values[::-1]
+        lo = df['low'].values[::-1]
+        cl = df['close'].values[::-1]
+        pip = self.data.get_pip_size(self.cfg.SYMBOL)
+
+        if is_bull:
+            recent_lh = -np.inf
+            for i in range(2, min(lookback, len(hi)-1)):
+                if hi[i] > hi[i-1] and hi[i] > hi[i+1]:
+                    recent_lh = max(recent_lh, hi[i])
+            if recent_lh == -np.inf:
+                return False
+            # Allow 2-bar window: either current or previous bar broke the level
+            broke_now  = len(cl) > 0 and cl[0] > recent_lh
+            broke_prev = len(cl) > 1 and cl[1] > recent_lh and cl[2] <= recent_lh
+            return broke_now or broke_prev
+        else:
+            recent_hl = np.inf
+            for i in range(2, min(lookback, len(lo)-1)):
+                if lo[i] < lo[i-1] and lo[i] < lo[i+1]:
+                    recent_hl = min(recent_hl, lo[i])
+            if recent_hl == np.inf:
+                return False
+            broke_now  = len(cl) > 0 and cl[0] < recent_hl
+            broke_prev = len(cl) > 1 and cl[1] < recent_hl and cl[2] >= recent_hl
+            return broke_now or broke_prev
+
+    # ── DXY Correlation Guard ───────────────────────────────────────────────
+
+    def check_dxy(self, direction: TradeDirection) -> bool:
+        if not self.cfg.USE_DXY:
+            return True
+        sym = self.cfg.SYMBOL
+        needs = any(x in sym for x in ['EUR', 'GBP', 'AUD', 'NZD', 'XAU', 'GOLD'])
+        usd_b = 'USD' in sym and not needs
+        if not needs and not usd_b:
+            return True
+
+        dxy_sym = self.cfg.DXY_SYMBOL
+        if mt5.symbol_info(dxy_sym) is None:
+            return True  # DXY not available — fail open
+
+        df = self.data.get_rates(dxy_sym, self.cfg.HTF_TF, self.cfg.DXY_LOOKBACK + 2)
+        if df is None or len(df) < 5:
+            return True
+
+        slope = Indicators.linear_regression_slope(df['close'])
+        if needs:
+            return (slope < 0 if direction == TradeDirection.BUY else slope > 0)
+        else:
+            return (slope > 0 if direction == TradeDirection.BUY else slope < 0)
+
+    # ── Order Flow Delta ────────────────────────────────────────────────────
+
+    def check_delta(self, direction: TradeDirection) -> bool:
+        ticks = self.data.get_ticks(self.cfg.SYMBOL, self.cfg.OB_LOOKBACK * 10)
+        if ticks is None or len(ticks) < 10:
+            return True  # No tick data — fail open
+
+        buy_vol  = ticks.loc[ticks['flags'].isin([mt5.TICK_FLAG_BUY,
+                              mt5.TICK_FLAG_BUY + mt5.TICK_FLAG_LAST]), 'volume'].sum()
+        sell_vol = ticks.loc[ticks['flags'].isin([mt5.TICK_FLAG_SELL,
+                              mt5.TICK_FLAG_SELL + mt5.TICK_FLAG_LAST]), 'volume'].sum()
+        total    = buy_vol + sell_vol
+        if total <= 0:
+            return True
+        ratio    = buy_vol / total
+        min_r    = 0.55
+        if direction == TradeDirection.BUY:
+            return ratio >= min_r and buy_vol > sell_vol
+        else:
+            return ratio <= (1 - min_r) and sell_vol > buy_vol
+
+    # ── Volume Profile ──────────────────────────────────────────────────────
+
+    def build_volume_profile(self):
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF, self.cfg.VP_BARS)
+        if df is None or len(df) < 10:
+            return
+
+        hi_max = df['high'].max()
+        lo_min = df['low'].min()
+        if hi_max <= lo_min:
+            return
+
+        buckets  = self.cfg.VP_BUCKETS
+        b_size   = (hi_max - lo_min) / buckets
+        vols     = np.zeros(buckets)
+
+        for _, row in df.iterrows():
+            bar_range = row['high'] - row['low']
+            if bar_range <= 0:
+                continue
+            lo_idx = max(0, min(buckets-1, int((row['low']  - lo_min) / b_size)))
+            hi_idx = max(0, min(buckets-1, int((row['high'] - lo_min) / b_size)))
+            for b in range(lo_idx, hi_idx + 1):
+                blo  = lo_min + b * b_size
+                bhi  = blo + b_size
+                ovlp = (min(row['high'], bhi) - max(row['low'], blo)) / bar_range
+                if ovlp > 0:
+                    vols[b] += row['tick_volume'] * ovlp
+
+        poc_idx  = int(np.argmax(vols))
+        total    = vols.sum()
+        target   = total * self.cfg.VP_VALUE_AREA_PCT / 100.0
+        acc      = vols[poc_idx]
+        vhi, vlo = poc_idx, poc_idx
+
+        while acc < target and (vhi < buckets-1 or vlo > 0):
+            n_hi = vols[vhi+1] if vhi < buckets-1 else 0
+            n_lo = vols[vlo-1] if vlo > 0 else 0
+            if n_hi >= n_lo and vhi < buckets-1:
+                vhi += 1; acc += vols[vhi]
+            elif vlo > 0:
+                vlo -= 1; acc += vols[vlo]
+            elif vhi < buckets-1:
+                vhi += 1; acc += vols[vhi]
+            else:
+                break
+
+        self.vp = VolumeProfileResult(
+            poc   = lo_min + (poc_idx + 0.5) * b_size,
+            vah   = lo_min + (vhi + 1.0) * b_size,
+            val   = lo_min + vlo * b_size,
+            is_valid = True
+        )
+
+    def check_vp_zone(self, direction: TradeDirection) -> bool:
+        if not self.cfg.USE_VP or not self.vp.is_valid:
+            return True
+        price   = mt5.symbol_info_tick(self.cfg.SYMBOL).bid
+        pip     = self.data.get_pip_size(self.cfg.SYMBOL)
+        poc_buf = self.cfg.VP_POC_BUFFER_PIPS * pip
+        if abs(price - self.vp.poc) <= poc_buf:
+            return False
+        if direction == TradeDirection.BUY  and price > self.vp.vah:
+            return False
+        if direction == TradeDirection.SELL and price < self.vp.val:
+            return False
+        return True
+
+    # ── VIX Cap ─────────────────────────────────────────────────────────────
+
+    def get_vix(self) -> float:
+        if not self.cfg.USE_VIX:
+            return 0.0
+        vix_sym = self.cfg.VIX_SYMBOL
+        info    = mt5.symbol_info(vix_sym)
+        if info is None:
+            return 0.0
+        tick    = mt5.symbol_info_tick(vix_sym)
+        if tick is None or tick.bid <= 0:
+            return 0.0
+        # Synthetic index guard: Deriv VIX75 has price ~5000+, not CBOE VIX range
+        if tick.bid > 200.0:
+            return 0.0
+        return tick.bid
+
+    def is_vix_clear(self) -> bool:
+        vix = self.get_vix()
+        return vix <= 0 or vix < self.cfg.VIX_MAX_LEVEL  # 0 = unavailable → clear
+
+    # ── MAIN EVALUATOR ──────────────────────────────────────────────────────
+
+    def evaluate(self) -> SMCResult:
+        """
+        IMPROVED v5.1: 
+        - DST-aware Kill Zone timing
+        - New ICT concepts: Displacement, Breaker Block, Absorption, Session Momentum
+        - Stricter entry conditions (4 of 5 pillars + momentum)
+        - Kill Zone-specific spread tolerance
+        """
+        r = SMCResult()
+
+        # ── PHASE 1: Always evaluate for display ────────────────────────────
+        r.spread_pips   = self.data.get_spread_pips(self.cfg.SYMBOL)
+        r.vix_level     = self.get_vix()
+        r.vix_clear     = self.is_vix_clear()
+        r.vix_caution   = 0 < r.vix_level < self.cfg.VIX_MAX_LEVEL and r.vix_level >= self.cfg.VIX_CAUTION_LEVEL
+
+        # Determine bias
+        bias1 = self.detect_bias(self.cfg.HTF_TF, 30)
+        bias2 = self.detect_bias(self.cfg.HTF_TF2, 20)
+        bull_bias = bias1 == MarketBias.BULL or bias2 == MarketBias.BULL
+        bear_bias = bias1 == MarketBias.BEAR or bias2 == MarketBias.BEAR
+        check_bull = (bull_bias and (not bear_bias or bias1 == MarketBias.BULL)) or (not bull_bias and not bear_bias)
+        tent_dir   = TradeDirection.BUY if check_bull else TradeDirection.SELL
+
+        # Always scan structures
+        self.scan_order_blocks(bias1)
+        self.scan_fvgs()
+        self.build_volume_profile()
+
+        # Always evaluate all 5 pillars + NEW ICT concepts
+        if bull_bias or bear_bias:
+            # IMPROVED: price_at_ob now returns tuple
+            ob_result = self.price_at_ob(check_bull)
+            if isinstance(ob_result, tuple):
+                ob_str, ob_age, ob_fresh = ob_result
+            else:
+                ob_str = ob_result
+                ob_age = 0
+                ob_fresh = ob_result > 0
+            
+            min_str = self.cfg.OB_MIN_STRENGTH
+            r.has_ob = ob_str >= min_str and ob_fresh
+            r.ob_strength = ob_str
+            r.ob_age_bars = ob_age
+            r.ob_is_fresh = ob_fresh
+            r.nearest_ob_info = self.get_nearest_ob_info()
+            
+            r.has_fvg = self.price_in_fvg(check_bull)
+            r.has_vol_spike = self.check_volume_spike()
+            r.has_divergence = self.check_divergence(check_bull)
+            r.adx_value = self._get_adx()
+            r.has_adx = r.adx_value >= self.cfg.ADX_MIN
+            r.has_adx_strong = r.adx_value >= self.cfg.ADX_STRONG
+            r.has_liq_sweep = self.detect_liquidity_sweep(check_bull)
+            
+            # NEW v5.1: Additional ICT concepts
+            disp_ev = self.detect_displacement(check_bull)
+            r.has_displacement = disp_ev.detected
+            r.displacement_pips = disp_ev.displacement_pips
+            r.displacement_bars = disp_ev.engulf_bars
+            
+            bb_detected, bb_strength = self.detect_breaker_block(check_bull)
+            r.has_breaker_block = bb_detected
+            r.breaker_strength = bb_strength
+            
+            abs_result = self.check_absorption(check_bull)
+            r.has_absorption = abs_result.detected
+            r.absorption_ratio = abs_result.volume_ratio
+            
+            sm = self.get_session_momentum(check_bull)
+            r.has_session_momentum = sm.direction == tent_dir and sm.strength >= 50
+            r.momentum_strength = sm.strength
+            r.momentum_direction = sm.direction
+            
+            # IMPROVED: SMC score now includes displacement and breaker block
+            r.smc_score = sum([
+                r.has_ob, r.has_fvg, r.has_vol_spike, 
+                r.has_divergence, r.has_adx,
+                r.has_displacement  # NEW
+            ])
+        else:
+            r.adx_value = self._get_adx()
+            r.has_adx = r.adx_value >= self.cfg.ADX_MIN
+            r.has_adx_strong = r.adx_value >= self.cfg.ADX_STRONG
+            r.has_vol_spike = self.check_volume_spike()
+            r.smc_score = 0
+
+        # Always evaluate alpha filters for display
+        r.dxy_confirmed = self.check_dxy(tent_dir)
+        r.delta_positive = self.check_delta(tent_dir)
+        r.vp_zone_valid = self.check_vp_zone(tent_dir)
+        r.vp = self.vp
+
+        # IMPROVED: Confidence calculation includes new concepts
+        safe_adx = r.adx_value if (isinstance(r.adx_value, float) and np.isfinite(r.adx_value)) else 0.0
+        safe_obs = r.ob_strength if (isinstance(r.ob_strength, float) and np.isfinite(r.ob_strength)) else 0.0
+        
+        score = (
+            (18.0 * safe_obs / 100.0 if r.has_ob else 0.0) +
+            (12.0 if r.has_fvg else 0.0) +
+            (10.0 if r.has_vol_spike else 0.0) +
+            (12.0 if r.has_divergence else 0.0) +
+            (12.0 * min(safe_adx / 50.0, 1.0) if r.has_adx else 0.0) +
+            (8.0 if r.dxy_confirmed else 0.0) +
+            (6.0 if r.delta_positive else 0.0) +
+            (5.0 if r.vp_zone_valid else 0.0) +
+            (7.0 if r.has_liq_sweep else 0.0) +
+            (8.0 if r.has_displacement else 0.0) +    # NEW
+            (6.0 if r.has_breaker_block else 0.0) +   # NEW
+            (4.0 if r.has_absorption else 0.0) +       # NEW
+            (4.0 if r.has_session_momentum else 0.0)  # NEW
+        )
+        r.confidence = min(float(score) if np.isfinite(score) else 0.0, 100.0)
+
+        # ── PHASE 2: Execution gates (hard blocks) ──────────────────────────
+
+        # Gate 1: DST-aware Kill Zone
+        kz_type, in_kz = self._get_kill_zone_status()
+        r.in_kill_zone = in_kz
+        r.kill_zone_type = kz_type
+        if not in_kz:
+            r.block_reason = FilterFailure.KILL_ZONE
+            return r
+
+        # Gate 2: VIX (stricter: 25 instead of 30)
+        if not r.vix_clear:
+            r.block_reason = FilterFailure.VIX
+            return r
+
+        # Gate 3: Spread (Kill Zone specific tolerance)
+        max_spread = self.cfg.MAX_SPREAD_POINTS_E1
+        if in_kz:
+            max_spread += self.cfg.KZ_SPREAD_TOLERANCE  # Wider spread allowed in KZ
+        if r.spread_pips * 10 > max_spread:
+            r.block_reason = FilterFailure.SPREAD
+            return r
+
+        # Gate 4: Bias
+        if not bull_bias and not bear_bias:
+            r.block_reason = FilterFailure.SMC
+            return r
+
+        # Gate 5: SMC score (stricter: 4 of 5)
+        if r.smc_score < self.cfg.MIN_CONFIRMATIONS:
+            r.block_reason = FilterFailure.SMC
+            return r
+
+        # Gate 6: MSS
+        if not self.detect_mss(check_bull):
+            r.block_reason = FilterFailure.SMC
+            return r
+
+        # Gate 7: Session Momentum (NEW)
+        if not r.has_session_momentum:
+            # Allow trade but with lower priority - check direction alignment
+            if r.momentum_direction != tent_dir and r.momentum_direction != TradeDirection.NONE:
+                r.block_reason = FilterFailure.SMC
+                return r
+
+        # Gate 8: DXY
+        if not r.dxy_confirmed:
+            r.block_reason = FilterFailure.DXY_CORR
+            return r
+
+        # Gate 9: VP
+        if not r.vp_zone_valid:
+            r.block_reason = FilterFailure.VOL_PROFILE
+            return r
+
+        # Gate 10: Delta
+        if not r.delta_positive:
+            r.block_reason = FilterFailure.DELTA
+            return r
+
+        # Gate 11: Displacement quality (NEW)
+        if self.cfg.USE_DISPLACEMENT and not r.has_displacement:
+            # Soft gate - allow if no displacement but strong other signals
+            if r.smc_score < 5:
+                r.block_reason = FilterFailure.SMC
+                return r
+
+        # Gate 12: Breaker Block confirmation (NEW)
+        if self.cfg.USE_BREAKER_BLOCK and not r.has_breaker_block:
+            # Soft gate - allow if other strong signals
+            if r.smc_score < 5 and not r.has_ob:
+                r.block_reason = FilterFailure.SMC
+                return r
+
+        # ── ALL GATES PASSED ─────────────────────────────────────────────────
+        atr   = self._get_atr()
+        tick  = mt5.symbol_info_tick(self.cfg.SYMBOL)
+        entry = tick.ask if check_bull else tick.bid
+
+        if check_bull:
+            r.sl_price  = entry - atr * self.cfg.ATR_SL_MULT
+            r.tp1_price = entry + (entry - r.sl_price) * self.cfg.E1_TP1_RR
+            r.tp2_price = entry + (entry - r.sl_price) * self.cfg.E1_TP2_RR
+        else:
+            r.sl_price  = entry + atr * self.cfg.ATR_SL_MULT
+            r.tp1_price = entry - (r.sl_price - entry) * self.cfg.E1_TP1_RR
+            r.tp2_price = entry - (r.sl_price - entry) * self.cfg.E1_TP2_RR
+
+        rr = abs(r.tp2_price - entry) / (abs(r.sl_price - entry) + 1e-10)
+        if rr < self.cfg.E1_TP1_RR:
+            r.block_reason = FilterFailure.LOW_RR
+            return r
+
+        r.fired    = True
+        r.direction = TradeDirection.BUY if check_bull else TradeDirection.SELL
+        return r
+
+    def _get_kill_zone_status(self) -> Tuple[str, bool]:
+        """
+        IMPROVED v5.1: DST-aware Kill Zone detection.
+        
+        London Kill Zone: 08:00-11:00 UK Time
+        NY Kill Zone: 08:00-11:00 EST (= 13:00-16:00 UTC during EST, 12:00-15:00 UTC during EDT)
+        
+        Automatically adjusts for Daylight Saving Time.
+        """
+        utc_now = datetime.now(timezone.utc)
+        
+        # UK Time (always UTC, but UK observes DST)
+        # UK DST: Last Sunday March to Last Sunday October
+        uk_month = utc_now.month
+        uk_day = utc_now.day
+        uk_weekday = utc_now.weekday()
+        
+        # Approximate DST detection for UK
+        # DST starts: Sunday of last week of March
+        # DST ends: Sunday of last week of October
+        uk_dst = False
+        if 3 < uk_month < 10:
+            uk_dst = True
+        elif uk_month == 3:
+            # Last Sunday of March (approximate)
+            days_to_last_sunday = (uk_day - uk_weekday) % 7
+            last_sunday = uk_day - (uk_weekday if uk_day > 25 else 0)
+            if last_sunday >= 25:
+                uk_dst = True
+        elif uk_month == 10:
+            days_to_last_sunday = (uk_day - uk_weekday) % 7
+            last_sunday = uk_day - (uk_weekday if uk_day > 25 else 0)
+            if last_sunday < 25:
+                uk_dst = True
+        
+        uk_hour = (utc_now.hour + (1 if uk_dst else 0)) % 24
+        
+        # EST/EDT detection (US observes DST)
+        est_offset = -5  # EST
+        if 3 < uk_month < 11:
+            est_offset = -4  # EDT
+        
+        est_hour = (utc_now.hour + est_offset) % 24
+        
+        # London Kill Zone (UK time)
+        london_kz = self.cfg.LONDON_KZ_START_UK <= uk_hour < self.cfg.LONDON_KZ_END_UK
+        
+        # NY Kill Zone (EST time)
+        ny_kz = self.cfg.NY_KZ_START_EST <= est_hour < self.cfg.NY_KZ_END_EST
+        
+        if london_kz:
+            return ("LONDON", True)
+        elif ny_kz:
+            return ("NY", True)
+        else:
+            return ("", False)
+
+    def _utc_hour(self) -> int:
+        utc = datetime.now(timezone.utc) - timedelta(hours=self.cfg.GMT_OFFSET)
+        return utc.hour
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 8 — ENGINE 2: OFF-ZONE MEAN REVERSION
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MeanReversionEngine:
+    """
+    Engine 2: Liquidity Sweep + Mean Reversion for off-kill-zone hours.
+    ALL 5 conditions must fire for a signal.
+    """
+
+    def __init__(self, cfg: Config, data: MT5DataLayer):
+        self.cfg       = cfg
+        self.data      = data
+        self.asia_box  = AsiaRangeBox()
+        self.vwap      = 0.0
+        self.ma20      = 0.0
+
+    def _utc_hour(self) -> int:
+        utc = datetime.now(timezone.utc) - timedelta(hours=self.cfg.GMT_OFFSET)
+        return utc.hour
+
+    def _today_midnight_utc(self) -> datetime:
+        now = datetime.now(timezone.utc) - timedelta(hours=self.cfg.GMT_OFFSET)
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # ── Condition 1: Asia Range (IMPROVED v5.1) ───────────────────────────
+
+    def build_asia_range(self):
+        """
+        IMPROVED v5.1: Asia Range with quality check.
+        
+        Requirements:
+        1. Range size >= E2_MIN_ASIA_RANGE (25 pips)
+        2. Range should be "quiet" - low volatility
+        3. Multiple touches of boundary = higher quality
+        """
+        self.asia_box = AsiaRangeBox()
+        today   = self._today_midnight_utc()
+        end_h   = self.cfg.ASIA_OPEN + self.cfg.ASIA_RANGE_HOURS
+        df      = self.data.get_rates(self.cfg.SYMBOL, self.cfg.E2_TF, 300)
+        if df is None:
+            return
+
+        mask = df.index.map(lambda t: (
+            (t.astimezone(timezone.utc) - timedelta(hours=self.cfg.GMT_OFFSET)) >= today and
+            self.cfg.ASIA_OPEN <= (t.astimezone(timezone.utc) - timedelta(hours=self.cfg.GMT_OFFSET)).hour < end_h
+        ))
+        asia_df = df[mask]
+        if len(asia_df) < 6:
+            return
+
+        hi_val   = asia_df['high'].max()
+        lo_val   = asia_df['low'].min()
+        pip      = self.data.get_pip_size(self.cfg.SYMBOL)
+        size     = (hi_val - lo_val) / pip
+        
+        # IMPROVED: Quality check - minimum range size (25 pips)
+        if size < self.cfg.E2_MIN_ASIA_RANGE:
+            return
+        
+        # IMPROVED: Check volatility - range should be "quiet"
+        # Calculate average candle size in Asia session
+        if len(asia_df) >= 4:
+            candle_sizes = (asia_df['high'] - asia_df['low']) / pip
+            avg_candle = candle_sizes.mean()
+            # If average candle is too large, market was too volatile
+            if avg_candle > size / 2:
+                log.debug("Asia range rejected: volatile session (avg candle %.1f vs range %.1f)", avg_candle, size)
+                return
+        
+        # IMPROVED: Count boundary touches for quality score
+        touch_threshold = pip * 2  # 2 pip tolerance
+        hi_touches = sum(abs(asia_df['high'] - hi_val) < touch_threshold)
+        lo_touches = sum(abs(asia_df['low'] - lo_val) < touch_threshold)
+        total_touches = hi_touches + lo_touches
+        
+        # If too few touches, range might not be well-defined
+        if total_touches < 2:
+            log.debug("Asia range low quality: only %d touches", total_touches)
+            # Still allow but log warning
+
+        self.asia_box = AsiaRangeBox(
+            hi=hi_val, lo=lo_val, mid=(hi_val+lo_val)/2.0,
+            size_pips=size, built_date=today, is_valid=True,
+            hi_swept=False, lo_swept=False
+        )
+        log.info("📊 Asia Range built: %.1f pips | touches:%d", size, total_touches)
+
+    # ── Condition 2: Liquidity Sweep ──────────────────────────────────────
+
+    def detect_sweep(self) -> SweepEvent:
+        ev = SweepEvent()
+        if not self.asia_box.is_valid:
+            return ev
+
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.E2_TF,
+                                  self.cfg.E2_REJECTION_BARS + 5)
+        if df is None or len(df) < self.cfg.E2_REJECTION_BARS + 3:
+            return ev
+
+        hi  = df['high'].values[::-1]
+        lo  = df['low'].values[::-1]
+        cl  = df['close'].values[::-1]
+        op  = df['open'].values[::-1]
+
+        # Bollinger Bands (3σ)
+        bb_df      = self.data.get_rates(self.cfg.SYMBOL, self.cfg.E2_TF,
+                                          self.cfg.E2_BB_PERIOD + 10)
+        if bb_df is None:
+            return ev
+        upper, _, lower = Indicators.bollinger_bands(
+            bb_df['close'], self.cfg.E2_BB_PERIOD, self.cfg.E2_BB_STDDEV)
+        bb_up  = upper.values[::-1]
+        bb_lo  = lower.values[::-1]
+        pip    = self.data.get_pip_size(self.cfg.SYMBOL)
+        min_sw = self.cfg.E2_SWEEP_MIN_PIPS * pip
+
+        for i in range(1, min(self.cfg.E2_REJECTION_BARS + 1, len(hi))):
+            # HIGH SWEEP → SELL signal
+            if (hi[i] > self.asia_box.hi + min_sw and
+                    (i < len(bb_up) and hi[i] > bb_up[i]) and
+                    cl[i] <= self.asia_box.hi and
+                    not self.asia_box.hi_swept):
+                self.asia_box.hi_swept = True
+                ev.detected    = True
+                ev.direction   = TradeDirection.SELL
+                ev.sweep_price = self.asia_box.hi
+                ev.bb_level    = bb_up[i] if i < len(bb_up) else 0
+                ev.sweep_bar_idx = i
+                return ev
+
+            # LOW SWEEP → BUY signal
+            if (lo[i] < self.asia_box.lo - min_sw and
+                    (i < len(bb_lo) and lo[i] < bb_lo[i]) and
+                    cl[i] >= self.asia_box.lo and
+                    not self.asia_box.lo_swept):
+                self.asia_box.lo_swept = True
+                ev.detected    = True
+                ev.direction   = TradeDirection.BUY
+                ev.sweep_price = self.asia_box.lo
+                ev.bb_level    = bb_lo[i] if i < len(bb_lo) else 0
+                ev.sweep_bar_idx = i
+                return ev
+
+        return ev
+
+    # ── Condition 3: Volume Exhaustion ────────────────────────────────────
+
+    def check_vol_exhaustion(self, sweep_bar: int) -> bool:
+        """
+        FIX: Ensure sweep_bar >= 1 (closed bar) not 0 (incomplete current bar).
+        An incomplete current bar always shows artificially low volume,
+        causing false exhaustion signals. Always use last CLOSED bar.
+        """
+        safe_bar = max(1, sweep_bar)  # Never use bar[0] (incomplete)
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.E2_TF,
+                                  self.cfg.E2_BB_PERIOD + safe_bar + 5)
+        if df is None or len(df) < self.cfg.E2_BB_PERIOD + 3:
+            return False
+        vol   = df['tick_volume'].values[::-1]
+        start = safe_bar + 1
+        if start + self.cfg.E2_BB_PERIOD > len(vol):
+            return False
+        sma = np.mean(vol[start:start + self.cfg.E2_BB_PERIOD])
+        if sma <= 0:
+            return False
+        return float(vol[safe_bar]) < self.cfg.E2_VOL_EXHAUST * sma
+
+    # ── Condition 4: Rejection Candle ─────────────────────────────────────
+
+    def detect_rejection(self, direction: TradeDirection) -> bool:
+        return (self._check_rejection_tf(self.cfg.E2_TF, direction, self.cfg.E2_REJECTION_BARS) or
+                self._check_rejection_tf(self.cfg.E2_CONFIRM_TF, direction, self.cfg.E2_REJECTION_BARS + 1))
+
+    def _check_rejection_tf(self, tf: int, direction: TradeDirection, lookback: int) -> bool:
+        df = self.data.get_rates(self.cfg.SYMBOL, tf, lookback + 5)
+        if df is None or len(df) < lookback + 2:
+            return False
+        hi = df['high'].values[::-1]
+        lo = df['low'].values[::-1]
+        cl = df['close'].values[::-1]
+        op = df['open'].values[::-1]
+        pt = self.data.get_point(self.cfg.SYMBOL)
+
+        for i in range(1, min(lookback + 1, len(cl) - 1)):
+            total = hi[i] - lo[i]
+            if total < pt * 2:
+                continue
+            up_wick = hi[i] - max(cl[i], op[i])
+            dn_wick = min(cl[i], op[i]) - lo[i]
+
+            # Pin Bar
+            if direction == TradeDirection.BUY:
+                if dn_wick / total * 100.0 >= self.cfg.E2_PINBAR_WICK_PCT and cl[i] > op[i]:
+                    return True
+            else:
+                if up_wick / total * 100.0 >= self.cfg.E2_PINBAR_WICK_PCT and cl[i] < op[i]:
+                    return True
+
+            # Engulfing
+            if i + 1 < len(cl):
+                prev_body = abs(cl[i+1] - op[i+1])
+                if prev_body > pt:
+                    bull_eng = (direction == TradeDirection.BUY and cl[i] > op[i] and
+                                op[i] < cl[i+1] and cl[i] > op[i+1])
+                    bear_eng = (direction == TradeDirection.SELL and cl[i] < op[i] and
+                                op[i] > cl[i+1] and cl[i] < op[i+1])
+                    if bull_eng or bear_eng:
+                        return True
+
+            # Close-back-inside
+            if direction == TradeDirection.BUY and self.asia_box.is_valid:
+                if lo[i] < self.asia_box.lo and cl[i] > self.asia_box.lo:
+                    if i > 1 and cl[i-1] > cl[i]:
+                        return True
+            elif self.asia_box.is_valid:
+                if hi[i] > self.asia_box.hi and cl[i] < self.asia_box.hi:
+                    if i > 1 and cl[i-1] < cl[i]:
+                        return True
+
+        return False
+
+    # ── Condition 5: RSI Extreme ───────────────────────────────────────────
+
+    def check_rsi_extreme(self, direction: TradeDirection, sweep_bar: int) -> bool:
+        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.E2_TF, sweep_bar + 10)
+        if df is None or len(df) < sweep_bar + 5:
+            return False
+        rsi_series = Indicators.rsi(df['close'], self.cfg.RSI_PERIOD).fillna(50.0)
+        rsi = rsi_series.values[::-1]
+        if sweep_bar >= len(rsi) or len(rsi) < 2:
+            return False
+        rsi_sw  = rsi[sweep_bar]
+        rsi_now = rsi[0]
+        # FIX ⑤: Buffer widened 5.0 → 8.0. Combined with E2_RSI thresholds now 65/35,
+        # BUY triggers if RSI at sweep ≤35 OR current ≤43; SELL if ≥65 OR current ≥57.
+        # Catches more Asian-session setups where RSI recovers before entry bar closes.
+        if direction == TradeDirection.BUY:
+            was_os  = rsi_sw <= self.cfg.E2_RSI_OS or rsi_now <= self.cfg.E2_RSI_OS + 8.0
+            rising  = rsi[0] > rsi[1]
+            return was_os and rising
+        else:
+            was_ob  = rsi_sw >= self.cfg.E2_RSI_OB or rsi_now >= self.cfg.E2_RSI_OB - 8.0
+            falling = rsi[0] < rsi[1]
+            return was_ob and falling
+
+    # ── Dynamic TP: VWAP / 20-SMA ─────────────────────────────────────────
+
+    def compute_tp(self, direction: TradeDirection, entry: float) -> float:
+        pip    = self.data.get_pip_size(self.cfg.SYMBOL)
+        today  = self._today_midnight_utc()
+        df     = self.data.get_rates(self.cfg.SYMBOL, self.cfg.E2_TF, self.cfg.E2_VWAP_BARS)
+
+        if df is not None and len(df) > 5:
+            today_df = df[df.index.map(lambda t:
+                          t.astimezone(timezone.utc) - timedelta(hours=self.cfg.GMT_OFFSET) >= today)]
+            if len(today_df) > 3:
+                tp3   = (today_df['high'] + today_df['low'] + today_df['close']) / 3.0
+                vol   = today_df['tick_volume']
+                vol_sum = vol.replace([np.inf, -np.inf], np.nan).dropna().sum()
+                tp3_clean = tp3.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                vwap  = (tp3_clean * vol).sum() / vol_sum if vol_sum > 0 else 0.0
+                if vwap > 0:
+                    self.vwap = vwap
+                    dist = abs(vwap - entry) / pip
+                    side = ((direction == TradeDirection.BUY  and vwap > entry) or
+                            (direction == TradeDirection.SELL and vwap < entry))
+                    if self.cfg.E2_TP_MIN_PIPS <= dist <= self.cfg.E2_TP_MAX_PIPS and side:
+                        return vwap
+
+            # Fallback: 20-SMA
+            ma20_val = Indicators.sma(df['close'], 20).dropna()
+            ma20     = float(ma20_val.iloc[-1]) if len(ma20_val) > 0 else float('nan')
+            if not np.isnan(ma20):
+                self.ma20 = ma20
+                dist = abs(ma20 - entry) / pip
+                side = ((direction == TradeDirection.BUY  and ma20 > entry) or
+                        (direction == TradeDirection.SELL and ma20 < entry))
+                if self.cfg.E2_TP_MIN_PIPS <= dist <= self.cfg.E2_TP_MAX_PIPS and side:
+                    return ma20
+
+        # Last resort: fixed pip floor
+        delta = self.cfg.E2_TP_MIN_PIPS * pip
+        return entry + delta if direction == TradeDirection.BUY else entry - delta
+
+    # ── MAIN EVALUATOR ──────────────────────────────────────────────────────
+
+    def evaluate(self) -> ReversionResult:
+        """
+        ENGINE 2 EVALUATOR — Phase 1/2 pattern (same as Engine 1):
+        PHASE 1: Always evaluate ALL 5 conditions for live dashboard display.
+                 Spread block no longer prevents condition evaluation.
+        PHASE 2: Apply execution gates (spread, etc.) before placing trade.
+        This fixes: "Block: SPREAD stops all condition checks" bug.
+        """
+        r = ReversionResult()
+        r.spread_pips = self.data.get_spread_pips(self.cfg.SYMBOL)
+
+        # ── PHASE 1: Always evaluate for display ────────────────────────────
+
+        # Daily Asia range reset
+        today    = self._today_midnight_utc()
+        utc_h    = self._utc_hour()
+        need_rebuild = (not self.asia_box.is_valid or
+                        self.asia_box.built_date != today or
+                        (utc_h == self.cfg.ASIA_OPEN and
+                         datetime.now().minute < 10))
+        if need_rebuild:
+            self.asia_box.hi_swept = False
+            self.asia_box.lo_swept = False
+            self.build_asia_range()
+
+        # Condition 1 — always check for display
+        r.c1_range_valid = self.asia_box.is_valid
+
+        # Condition 2 — always check for display
+        sweep = self.detect_sweep()
+        r.c2_sweep    = sweep.detected
+        r.sweep_level = sweep.sweep_price if sweep.detected else 0.0
+
+        # Conditions 3-5 — evaluate if sweep found
+        if sweep.detected:
+            r.c3_vol_exhaust = self.check_vol_exhaustion(sweep.sweep_bar_idx)
+            r.c4_rejection   = self.detect_rejection(sweep.direction)
+            r.c5_rsi_extreme = self.check_rsi_extreme(sweep.direction, sweep.sweep_bar_idx)
+        else:
+            # Still try to detect rejection in last few bars for display
+            for d in [TradeDirection.BUY, TradeDirection.SELL]:
+                if self.detect_rejection(d):
+                    r.c4_rejection = True
+                    break
+            # FIX ⑤: RSI requires a sweep to be meaningful — do NOT compute it
+            # without one.  Previously this set c5_rsi_extreme=True (RSI:1 on dashboard)
+            # even when sweep=0, which was misleading and inflated confidence by 20%.
+            # Without a sweep the RSI reading is irrelevant to the E2 setup.
+            r.c5_rsi_extreme = False
+
+        # Compute confidence for display (all 5 conditions weighted)
+        r.confidence = (
+            (15.0 if r.c1_range_valid  else 0.0) +
+            (25.0 if r.c2_sweep        else 0.0) +
+            (20.0 if r.c3_vol_exhaust  else 0.0) +
+            (20.0 if r.c4_rejection    else 0.0) +
+            (20.0 if r.c5_rsi_extreme  else 0.0)
+        )
+
+        # ── PHASE 2: Execution gates (hard blocks for actual trading) ────────
+
+        # Gate 1: Spread guard
+        if r.spread_pips > self.cfg.MAX_SPREAD_PIPS:
+            r.block_reason = FilterFailure.SPREAD
+            return r  # direction stays NONE — display values populated
+
+        # Gate 2: Asia range required
+        if not r.c1_range_valid:
+            r.block_reason = FilterFailure.NO_RANGE
+            return r
+
+        # Gate 3: Sweep required
+        if not r.c2_sweep:
+            r.block_reason = FilterFailure.NO_SWEEP
+            return r
+        r.direction = sweep.direction
+
+        # Gate 4: Volume exhaustion
+        if not r.c3_vol_exhaust:
+            r.block_reason = FilterFailure.VOLUME
+            r.direction    = TradeDirection.NONE
+            return r
+
+        # Gate 5: Rejection candle
+        if not r.c4_rejection:
+            r.block_reason = FilterFailure.NO_REJECTION
+            r.direction    = TradeDirection.NONE
+            return r
+
+        # Gate 6: RSI extreme
+        if not r.c5_rsi_extreme:
+            r.block_reason = FilterFailure.RSI
+            r.direction    = TradeDirection.NONE
+            return r
+
+        # ── SL / TP calculation ───────────────────────────────────────────────
+        pip    = self.data.get_pip_size(self.cfg.SYMBOL)
+        tick   = mt5.symbol_info_tick(self.cfg.SYMBOL)
+        if tick is None:
+            r.block_reason = FilterFailure.SPREAD
+            r.direction    = TradeDirection.NONE
+            return r
+
+        entry  = tick.ask if sweep.direction == TradeDirection.BUY else tick.bid
+        sl_buf = self.cfg.E2_SWEEP_MIN_PIPS * pip * 3
+
+        r.entry_price = entry
+        r.sl_price    = (self.asia_box.lo - sl_buf if sweep.direction == TradeDirection.BUY
+                         else self.asia_box.hi + sl_buf)
+        r.tp_price    = self.compute_tp(sweep.direction, entry)
+        r.vwap        = self.vwap
+
+        risk   = abs(entry - r.sl_price)
+        reward = abs(r.tp_price - entry)
+        if reward < risk * 0.9:
+            r.block_reason = FilterFailure.LOW_RR
+            r.direction    = TradeDirection.NONE
+            return r
+
+        r.fired = True
+        return r
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 9 — POSITION MANAGER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PositionManager:
+    """
+    IMPROVED v5.1: Handles breakeven, partial close, and trailing stop.
+    
+    Key improvements:
+    - E1: BE trigger at 1.5:1 R:R (instead of 1:1) to avoid choppy market BE hits
+    - E1: Tighter ATR trailing (0.75x instead of 1.0x)
+    - E2: BE trigger at +10 pips (increased from +7)
+    """
+
+    def __init__(self, cfg: Config, data: MT5DataLayer, executor: TradeExecutor):
+        self.cfg = cfg
+        self.data = data
+        self.exe  = executor
+
+    def manage(self, engine: EngineState):
+        positions = self.data.get_positions(self.cfg.MAGIC, self.cfg.SYMBOL)
+        for pos in positions:
+            if engine == EngineState.KILL_ZONE_SMC:
+                self._manage_e1(pos)
+            else:
+                self._manage_e2(pos)
+
+    def _manage_e1(self, pos):
+        """Engine 1: BE at 1.5:1 R:R, tighter ATR trailing"""
+        entry   = pos.price_open
+        cur     = pos.price_current
+        sl      = pos.sl
+        tp      = pos.tp
+        is_buy  = pos.type == mt5.POSITION_TYPE_BUY
+        pip     = self.data.get_pip_size(pos.symbol)
+        pt      = self.data.get_point(pos.symbol)
+        profit_pts = (cur - entry if is_buy else entry - cur) / pt
+
+        # BE trigger at 1.5:1 R:R (more conservative)
+        risk_pts = abs(entry - sl) / pt if sl > 0 else self.cfg.BE_TRIGGER_POINTS_E1 * 2
+        be_trigger_pts = risk_pts * 1.5  # 1.5:1 instead of 1:1
+        
+        if profit_pts >= be_trigger_pts and not self.exe.is_partial_done(pos.ticket):
+            if self.exe.close_partial(pos, self.cfg.PARTIAL_CLOSE_PCT):
+                self.exe.mark_partial_done(pos.ticket)
+                be_buf = self.cfg.BE_BUFFER_PIPS_E1 * pip
+                new_sl = round(entry + be_buf if is_buy else entry - be_buf, pos.digits)
+                ok     = is_buy and new_sl > sl or not is_buy and (sl == 0 or new_sl < sl)
+                if ok:
+                    self.exe.modify_position(pos.ticket, new_sl, tp)
+                    log.info("🔒 E1 BE+%.1f pip | 1.5:1 RR | ticket %d", 
+                            self.cfg.BE_BUFFER_PIPS_E1, pos.ticket)
+
+        # Tighter ATR trailing (0.75x instead of 1.0x)
+        if self.exe.is_partial_done(pos.ticket):
+            df  = self.data.get_rates(pos.symbol, self.cfg.HTF_TF, self.cfg.ATR_PERIOD * 3)
+            if df is not None:
+                atr_s = Indicators.atr(df['high'], df['low'], df['close'],
+                                      self.cfg.ATR_PERIOD)
+                atr_v = atr_s.dropna()
+                atr   = float(atr_v.iloc[-1]) if len(atr_v) > 0 else float((df['high']-df['low']).tail(5).mean())
+                if np.isnan(atr) or atr <= 0:
+                    atr = float((df['high']-df['low']).tail(5).mean())
+                
+                trail_mult = getattr(self.cfg, 'TRAIL_ATR_MULT_V2', 0.75)
+                step = self.cfg.TRAIL_STEP_POINTS * pt
+                
+                if is_buy:
+                    new_sl = round(cur - atr * trail_mult, pos.digits)
+                    if new_sl > sl + step and new_sl < cur:
+                        min_sl = cur - atr * 0.5
+                        new_sl = max(new_sl, min_sl)
+                        self.exe.modify_position(pos.ticket, new_sl, tp)
+                else:
+                    new_sl = round(cur + atr * trail_mult, pos.digits)
+                    if (sl == 0 or new_sl < sl - step) and new_sl > cur:
+                        min_sl = cur + atr * 0.5
+                        new_sl = min(new_sl, min_sl)
+                        self.exe.modify_position(pos.ticket, new_sl, tp)
+
+    def _manage_e2(self, pos):
+        """Engine 2: BE trigger at +10 pips (increased from +7)"""
+        entry  = pos.price_open
+        cur    = pos.price_current
+        sl     = pos.sl
+        tp     = pos.tp
+        is_buy = pos.type == mt5.POSITION_TYPE_BUY
+        pip    = self.data.get_pip_size(pos.symbol)
+        profit_pips = abs(cur - entry) / pip
+
+        be_trigger = getattr(self.cfg, 'BE_TRIGGER_PIPS_E2', 10.0)
+        if profit_pips >= be_trigger and not self.exe.is_partial_done(pos.ticket):
+            be_buf = self.cfg.BE_BUFFER_PIPS * pip
+            new_sl = round(entry + be_buf if is_buy else entry - be_buf, pos.digits)
+            ok     = is_buy and (new_sl > sl or sl == 0) or not is_buy and (new_sl < sl or sl == 0)
+            if ok:
+                if self.exe.modify_position(pos.ticket, new_sl, tp):
+                    self.exe.mark_partial_done(pos.ticket)
+                    log.info("🔒 E2 BE+%.1fpip | ticket %d", self.cfg.BE_BUFFER_PIPS, pos.ticket)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 10 — NEURAL FEEDBACK v3 (IMPROVED)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NeuralFeedback:
+    """
+    IMPROVED v5.1: Per-engine rolling accuracy tracker with circuit breaker.
+    
+    Key improvements:
+    - Larger sample size (50 trades instead of 10)
+    - Session-specific tracking
+    - Win streak/loss streak tracking
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg    = cfg
+        self.e1     = EngineStats()
+        self.e2     = EngineStats()
+        self._history: deque = deque(maxlen=cfg.NF_TRADE_MEMORY * 2)
+        
+        # Session-specific tracking
+        self.session_stats = {
+            "LONDON": EngineStats(),
+            "NY": EngineStats(),
+            "ASIAN": EngineStats(),
+            "OTHER": EngineStats()
+        }
+        
+        # Streak tracking
+        self.win_streak = 0
+        self.loss_streak = 0
+
+    def record(self, engine: EngineState, is_win: bool, profit: float, confidence: float, session: str = ""):
+        stats = self.e1 if engine == EngineState.KILL_ZONE_SMC else self.e2
+        stats.record(is_win, profit)
+        
+        # Update streak
+        if is_win:
+            self.win_streak += 1
+            self.loss_streak = 0
+        else:
+            self.loss_streak += 1
+            self.win_streak = 0
+        
+        # Session-specific tracking
+        if session in self.session_stats:
+            self.session_stats[session].record(is_win, profit)
+        
+        self._history.append(TradeRecord(is_win, profit,
+                                          datetime.now(timezone.utc), engine, confidence))
+        self._update_circuit_breaker(engine)
+        log.info("📊 Neural | E%d | %s | P&L:%.2f | Acc:%.1f%% | Streak:%d",
+                 int(engine), "WIN" if is_win else "LOSS", profit, stats.accuracy,
+                 self.win_streak if is_win else -self.loss_streak)
+
+    def _update_circuit_breaker(self, engine: EngineState):
+        stats = self.e1 if engine == EngineState.KILL_ZONE_SMC else self.e2
+        
+        # Require larger sample (50 instead of 10)
+        if stats.total_trades >= max(50, self.cfg.NF_TRADE_MEMORY):
+            if stats.accuracy < self.cfg.NF_MIN_ACCURACY and not stats.is_paused:
+                stats.is_paused    = True
+                stats.paused_until = datetime.now(timezone.utc) + timedelta(minutes=self.cfg.NF_PAUSE_MINS)
+                log.warning("⚠️ Engine %d PAUSED for %d min | Acc:%.1f%% | Trades:%d",
+                            int(engine), self.cfg.NF_PAUSE_MINS, stats.accuracy, stats.total_trades)
+            elif stats.accuracy >= 85.0:
+                stats.is_paused = False
+
+    def is_paused(self, engine: EngineState) -> bool:
+        stats = self.e1 if engine == EngineState.KILL_ZONE_SMC else self.e2
+        if stats.is_paused and stats.paused_until:
+            if datetime.now(timezone.utc) >= stats.paused_until:
+                stats.is_paused = False
+                log.info("✅ Engine %d circuit breaker RESET", int(engine))
+                return False
+        return stats.is_paused
+    
+    def get_session_accuracy(self, session: str) -> Tuple[float, int]:
+        """Get accuracy for specific session"""
+        if session in self.session_stats:
+            s = self.session_stats[session]
+            return (s.accuracy, s.total_trades)
+        return (0.0, 0)
+    
+    def is_hot_streak(self, min_wins: int = 3) -> bool:
+        """Check if in winning streak"""
+        return self.win_streak >= min_wins
+    
+    def is_cold_streak(self, min_losses: int = 3) -> bool:
+        """Check if in losing streak"""
+        return self.loss_streak >= min_losses
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 11 — TERMINAL DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TerminalDashboard:
+    """Rich terminal dashboard showing live engine state"""
+
+    def __init__(self, cfg: Config):
+        self.cfg     = cfg
+        self.console = Console() if RICH_AVAILABLE else None
+        self._e1     = SMCResult()
+        self._e2     = ReversionResult()
+        self._state  = EngineState.DEAD_ZONE
+        self._nf     = None
+        self._acc    = None
+
+    def update(self, state: EngineState, e1: SMCResult,
+               e2: ReversionResult, nf: NeuralFeedback, acc: dict):
+        self._e1    = e1
+        self._e2    = e2
+        self._state = state
+        self._nf    = nf
+        self._acc   = acc
+        self._render()
+
+    def _render(self):
+        if not RICH_AVAILABLE:
+            self._render_plain()
+            return
+
+        c   = self.console
+        e1  = self._e1
+        e2  = self._e2
+        nf  = self._nf
+
+        def tick(v): return "✔" if v else "✗"
+        def col(v):  return "green" if v else "red"
+
+        # Engine banner
+        state_str = {
+            EngineState.KILL_ZONE_SMC:     "[bold green]▶▶ ENGINE 1 ACTIVE — SMC KILL ZONE[/]",
+            EngineState.OFFZONE_REVERSION:  "[bold magenta]▶▶ ENGINE 2 ACTIVE — MEAN REVERSION[/]",
+            EngineState.DEAD_ZONE:          "[dim]  STANDBY — DEAD ZONE (20:00–00:00 UTC)[/]",
+        }.get(self._state, "UNKNOWN")
+
+        c.rule(f"INSTITUTIONAL ALPHA ENGINE v5.0 | {datetime.now().strftime('%H:%M:%S')} UTC")
+        c.print(state_str)
+
+        # Engine 1 table
+        t1 = Table(title="ENGINE 1 — SMC KILL ZONE", box=box.SIMPLE_HEAD, show_lines=True)
+        t1.add_column("FILTER", style="dim", width=28)
+        t1.add_column("STATUS", width=22)
+        t1.add_column("VALUE",  width=15)
+
+        kz_str  = "IN KILL ZONE" if e1.in_kill_zone else "OUTSIDE KZ"
+        kz_col  = "green" if e1.in_kill_zone else "yellow"
+        t1.add_row("① Kill Zone",          f"[{kz_col}]{kz_str}[/]", "")
+        # FIX ②: use e1.nearest_ob_info (populated in evaluate()) — self._e1 bug removed
+        ob_detail  = f"Str:{e1.ob_strength:.0f}%" if e1.has_ob else e1.nearest_ob_info
+        t1.add_row("② Order Block (H1/H4)",f"[{col(e1.has_ob)}]{tick(e1.has_ob)} OB[/]",
+                   ob_detail)
+        t1.add_row("③ Fair Value Gap (M15)",f"[{col(e1.has_fvg)}]{tick(e1.has_fvg)} FVG[/]", "")
+        t1.add_row("④ Volume Spike ≥1.5×", f"[{col(e1.has_vol_spike)}]{tick(e1.has_vol_spike)}[/]", "")
+        t1.add_row("⑤ RSI/MACD Divergence",f"[{col(e1.has_divergence)}]{tick(e1.has_divergence)}[/]", "")
+        t1.add_row("⑥ ADX Trend (>25)",    f"[{col(e1.has_adx)}]{tick(e1.has_adx)}[/]",
+                   f"ADX:{e1.adx_value:.1f}" if np.isfinite(e1.adx_value) else "ADX:---")
+        t1.add_row("─── ALPHA FILTERS ───", "", "")
+        t1.add_row("⑦ DXY Correlation",    f"[{col(e1.dxy_confirmed)}]{tick(e1.dxy_confirmed)} {'INVERSE' if e1.dxy_confirmed else 'FAKE MOVE'}[/]", "")
+        t1.add_row("⑧ Order Flow Delta",   f"[{col(e1.delta_positive)}]{tick(e1.delta_positive)} {'ALIGNED' if e1.delta_positive else 'OPPOSED'}[/]", "")
+        t1.add_row("⑨ Volume Profile",     f"[{col(e1.vp_zone_valid)}]{tick(e1.vp_zone_valid)} {'VALID' if e1.vp_zone_valid else 'AT POC/OOB'}[/]",
+                   f"POC:{e1.vp.poc:.5f}" if e1.vp.is_valid else "N/A")
+        vix_str = f"{e1.vix_level:.1f}" if e1.vix_level > 0 else "N/A"
+        t1.add_row("⑩ VIX Cap (<30)",      f"[{col(e1.vix_clear)}]{tick(e1.vix_clear)} {'CLEAR' if e1.vix_clear else 'HALTED'}[/]",
+                   vix_str)
+
+        smc_clr = "green" if e1.smc_score >= self.cfg.MIN_CONFIRMATIONS else "red"
+        t1.add_row("SMC SCORE",            f"[{smc_clr}]{e1.smc_score}/5[/]", "")
+        conf_bar= "█" * int(e1.confidence / 10) + "░" * (10 - int(e1.confidence / 10))
+        t1.add_row("CONFIDENCE",           f"{conf_bar}", f"{e1.confidence:.0f}%")
+
+        dir_str = {TradeDirection.BUY: "[green]▲ BUY SIGNAL[/]",
+                   TradeDirection.SELL:"[red]▼ SELL SIGNAL[/]",
+                   TradeDirection.NONE:"[yellow]◆ SCANNING[/]"}[e1.direction]
+        # Show detailed reason why trade was NOT taken
+        block_detail = {
+            FilterFailure.KILL_ZONE:   "Outside London/NY window",
+            FilterFailure.VIX:         "VIX above 30 — halt",
+            FilterFailure.SPREAD:      "Spread too wide",
+            FilterFailure.SMC:         "SMC score OR MSS not confirmed",
+            FilterFailure.DXY_CORR:    "DXY correlation fake move",
+            FilterFailure.DELTA:       "Order flow not aligned",
+            FilterFailure.VOL_PROFILE: "Price at POC zone",
+            FilterFailure.PASS:        "ALL gates passed",
+        }.get(e1.block_reason, e1.block_reason.name)
+
+        if e1.block_reason != FilterFailure.PASS:
+            t1.add_row("GATE BLOCK REASON", f"[yellow]{block_detail}[/]", "")
+        t1.add_row("SIGNAL",               dir_str, "")
+        e1_acc = f"{nf.e1.accuracy:.1f}% ({nf.e1.wins}W/{nf.e1.total_trades - nf.e1.wins}L)" if nf else "N/A"
+        t1.add_row("E1 ACCURACY",          f"[{'green' if nf and nf.e1.accuracy >= 75 else 'red'}]{e1_acc}[/]", "")
+        t1.add_row("SPREAD",               f"[{'green' if e1.spread_pips <= 1.5 else 'red'}]{e1.spread_pips:.2f} pip[/]", "")
+        c.print(t1)
+
+        # Engine 2 table
+        t2 = Table(title="ENGINE 2 — MEAN REVERSION", box=box.SIMPLE_HEAD, show_lines=True)
+        t2.add_column("FILTER", style="dim", width=28)
+        t2.add_column("STATUS", width=30)
+
+        ar_str = (f"H:{e2.sweep_level:.5f}" if e2.sweep_level > 0 else "Building...")
+        t2.add_row("① Asia Range",       f"[{col(e2.c1_range_valid)}]{tick(e2.c1_range_valid)}[/] {ar_str}")
+        t2.add_row("② Liq. Sweep (BB 3σ)",f"[{col(e2.c2_sweep)}]{tick(e2.c2_sweep)} {'@'+str(round(e2.sweep_level,5)) if e2.c2_sweep else 'PENDING'}[/]")
+        t2.add_row("③ Vol. Exhaustion",  f"[{col(e2.c3_vol_exhaust)}]{tick(e2.c3_vol_exhaust)} {'LOW VOL ✓' if e2.c3_vol_exhaust else 'HIGH VOL ✗'}[/]")
+        t2.add_row("④ Rejection Candle", f"[{col(e2.c4_rejection)}]{tick(e2.c4_rejection)} {'CONFIRMED' if e2.c4_rejection else 'NONE'}[/]")
+        t2.add_row("⑤ RSI Extreme (>75/<25)",f"[{col(e2.c5_rsi_extreme)}]{tick(e2.c5_rsi_extreme)} {'EXTREME' if e2.c5_rsi_extreme else 'NEUTRAL'}[/]")
+        t2.add_row("SPREAD",             f"[{'green' if e2.spread_pips <= self.cfg.MAX_SPREAD_PIPS else 'red'}]{e2.spread_pips:.2f} pip ({'SAFE' if e2.spread_pips <= self.cfg.MAX_SPREAD_PIPS else 'BLOCKED'})[/]")
+        e2_dir = {TradeDirection.BUY: "[green]▲ BUY[/]", TradeDirection.SELL:"[red]▼ SELL[/]",
+                  TradeDirection.NONE:f"[yellow]— {e2.block_reason.name}[/]"}[e2.direction]
+        t2.add_row("SIGNAL",             e2_dir)
+        conf_e2_bar = "█" * int(e2.confidence/10) + "░" * (10 - int(e2.confidence/10))
+        t2.add_row("E2 CONFIDENCE",      f"{conf_e2_bar} {e2.confidence:.0f}%")
+        e2_acc = f"{nf.e2.accuracy:.1f}% ({nf.e2.wins}W/{nf.e2.total_trades - nf.e2.wins}L)" if nf else "N/A"
+        t2.add_row("E2 ACCURACY",        f"[{'green' if nf and nf.e2.accuracy >= 65 else 'red'}]{e2_acc}[/]")
+        vwap_str = f"VWAP:{e2.vwap:.5f}" if e2.vwap > 0 else "VWAP: computing"
+        t2.add_row("VWAP / Target",       f"[cyan]{vwap_str}[/]")
+        c.print(t2)
+
+        # Account
+        if self._acc:
+            c.print(
+                f"[dim]Balance:[/] [bold]{self._acc['balance']:.2f}[/]  "
+                f"[dim]Free Margin:[/] [bold green]{self._acc['free_margin']:.2f}[/]  "
+                f"[dim]Equity:[/] [bold]{self._acc['equity']:.2f}[/]"
+            )
+        c.print()
+
+    def _render_plain(self):
+        """Improved plain-text dashboard with all values"""
+        e1, e2 = self._e1, self._e2
+        nf     = self._nf
+        acc    = self._acc or {}
+        adx_s  = f"{e1.adx_value:.1f}" if (e1.adx_value and np.isfinite(e1.adx_value)) else "---"
+        vix_s  = f"{e1.vix_level:.1f}"  if e1.vix_level > 0 else "N/A"
+        kz_s   = "IN-KZ" if e1.in_kill_zone else "OUT-KZ"
+        e1_acc = f"{nf.e1.accuracy:.0f}%({nf.e1.wins}W/{nf.e1.total_trades-nf.e1.wins}L)" if nf and nf.e1.total_trades>0 else "N/A"
+        e2_acc = f"{nf.e2.accuracy:.0f}%({nf.e2.wins}W/{nf.e2.total_trades-nf.e2.wins}L)" if nf and nf.e2.total_trades>0 else "N/A"
+        conf_bar = chr(9608)*int(e1.confidence/10) + chr(9617)*(10-int(e1.confidence/10))
+        e2_conf  = chr(9608)*int(e2.confidence/10) + chr(9617)*(10-int(e2.confidence/10))
+
+        # FIX ①: ✅ TRADE! / ❌ block-reason signal format (was just "direction.name Block:reason")
+        e1_signal = "✅ TRADE! " + e1.direction.name if e1.fired else f"❌ {e1.block_reason.name}"
+        e2_signal = "✅ TRADE! " + e2.direction.name if e2.fired else f"❌ {e2.block_reason.name}"
+
+        # FIX ②: OB nearest distance pulled from SMCResult.nearest_ob_info
+        ob_nearest_str = e1.nearest_ob_info if not e1.has_ob else f"AT OB Str:{e1.ob_strength:.0f}%"
+
+        lines  = [
+            f"\n{'='*65}",
+            f"  INSTITUTIONAL ALPHA ENGINE v5.0 | {datetime.now().strftime('%H:%M:%S')} UTC",
+            f"  Session: {self._state.name:<20} | Balance: ${acc.get('balance',0):.2f}",
+            f"{'─'*65}",
+            f"  ENGINE 1 — SMC KILL ZONE",
+            f"  {kz_s} | Spread:{e1.spread_pips:.2f}pip | VIX:{vix_s} | ADX:{adx_s}",
+            f"  OB:{int(e1.has_ob)} [{ob_nearest_str}]",
+            f"  FVG:{int(e1.has_fvg)} Vol:{int(e1.has_vol_spike)} Div:{int(e1.has_divergence)} ADX:{adx_s}≥{self.cfg.ADX_MIN:.0f}:{int(e1.has_adx)}",
+            f"  DXY:{int(e1.dxy_confirmed)} Δ:{int(e1.delta_positive)} VP:{int(e1.vp_zone_valid)} Sweep:{int(e1.has_liq_sweep)}",
+            f"  SMC Score: {e1.smc_score}/5 | Confidence: {conf_bar} {e1.confidence:.0f}%",
+            f"  Signal ➜ {e1_signal} | Acc:{e1_acc}",
+            f"{'─'*65}",
+            f"  ENGINE 2 — MEAN REVERSION",
+            f"  Spread:{e2.spread_pips:.2f}pip | Asia:{int(e2.c1_range_valid)} Sweep:{int(e2.c2_sweep)} Vol:{int(e2.c3_vol_exhaust)} Rej:{int(e2.c4_rejection)} RSI:{int(e2.c5_rsi_extreme)}",
+            f"  Confidence: {e2_conf} {e2.confidence:.0f}% | VWAP:{e2.vwap:.5f}" if e2.vwap > 0 else f"  Confidence: {e2_conf} {e2.confidence:.0f}%",
+            f"  Signal ➜ {e2_signal} | Acc:{e2_acc}",
+            f"  FreeMgn:${acc.get('free_margin',0):.2f} | Equity:${acc.get('equity',0):.2f}",
+            f"{'='*65}",
+        ]
+        print("\n".join(lines))
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 12 — MASTER ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AlphaEngine_v5:
+    """
+    Master dual-engine controller.
+    Routes tick events to the correct engine based on UTC time.
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg      = cfg
+        self.data     = MT5DataLayer(cfg)
+        self.executor = TradeExecutor(cfg, self.data)
+        self.e1       = SMCKillZoneEngine(cfg, self.data, self.executor)
+        self.e2       = MeanReversionEngine(cfg, self.data)
+        self.pos_mgr  = PositionManager(cfg, self.data, self.executor)
+        self.nf       = NeuralFeedback(cfg)
+        self.dash     = TerminalDashboard(cfg)
+        self._running = False
+        self._last_e1 = SMCResult()
+        self._last_e2 = ReversionResult()
+        self._last_bar_time:     Optional[datetime] = None
+        self._last_display_time: Optional[datetime] = None
+        self._processed_deals:   set = set()  # FIX: track recorded deals
+
+    def get_engine_state(self) -> EngineState:
+        utc = datetime.now(timezone.utc) - timedelta(hours=self.cfg.GMT_OFFSET)
+        dow = utc.weekday()  # 5=Sat, 6=Sun
+        if dow >= 5:
+            return EngineState.DEAD_ZONE
+        h = utc.hour
+        if h >= self.cfg.DEAD_ZONE_START:
+            return EngineState.DEAD_ZONE
+        if self.cfg.LONDON_START <= h < self.cfg.LONDON_END:
+            return EngineState.KILL_ZONE_SMC
+        if self.cfg.NY_START    <= h < self.cfg.NY_END:
+            return EngineState.KILL_ZONE_SMC
+        return EngineState.OFFZONE_REVERSION
+
+    def count_global_trades(self) -> int:
+        """
+        FIX ③: Count ALL open positions across ALL symbols filtered by magic number.
+        Previously has_open_trade() only checked the current SYMBOL, so running 20 pairs
+        with MAX_GLOBAL_TRADES=1 allowed all 20 to open simultaneously → margin call risk.
+        Now one instance can see the total portfolio exposure.
+        """
+        all_positions = mt5.positions_get()
+        if all_positions is None:
+            return 0
+        return sum(1 for p in all_positions if p.magic == self.cfg.MAGIC)
+
+    def has_open_trade(self) -> bool:
+        """Returns True if global trade count meets or exceeds MaxGlobalTrades limit."""
+        return self.count_global_trades() >= self.cfg.MAX_GLOBAL_TRADES
+
+    def on_bar(self):
+        """Called on each new M5 bar"""
+        state = self.get_engine_state()
+
+        # FIX ④: Block ALL trading when MT5 data is stale (connection lost mid-TTL).
+        # Dashboard evaluation still runs below so the display stays live.
+        _data_stale = self.data.is_data_stale()
+        if _data_stale:
+            log.warning("⚠️  MT5 data stale (>%ss without fresh feed) — "
+                        "trade execution BLOCKED this bar.", self.cfg.MT5_STALE_BLOCK_SEC)
+
+        # Position management
+        self.pos_mgr.manage(state)
+
+        # Engine routing
+        if state == EngineState.KILL_ZONE_SMC:
+            # Engine 1: ALWAYS evaluate (for dashboard), only trade if gates pass
+            e1_result = self.e1.evaluate()
+            self._last_e1 = e1_result
+
+            # FIX ④: skip trade execution (but not evaluate) when data is stale
+            if (e1_result.fired and
+                    not _data_stale and
+                    not self.has_open_trade() and
+                    not self.nf.is_paused(EngineState.KILL_ZONE_SMC)):
+
+                pip    = self.data.get_pip_size(self.cfg.SYMBOL)
+                sl_pts = abs((mt5.symbol_info_tick(self.cfg.SYMBOL).ask
+                              if e1_result.direction == TradeDirection.BUY
+                              else mt5.symbol_info_tick(self.cfg.SYMBOL).bid)
+                             - e1_result.sl_price) / pip
+                lot    = self.executor.calculate_lot_e1(self.cfg.SYMBOL, sl_pts)
+
+                comment = (f"IAE_v5_E1|{e1_result.direction.name}|"
+                           f"Conf:{e1_result.confidence:.0f}%|"
+                           f"SMC:{e1_result.smc_score}/5")
+
+                ticket = self.executor.open_trade(
+                    self.cfg.SYMBOL, e1_result.direction,
+                    lot, e1_result.sl_price, e1_result.tp2_price, comment)
+
+                if ticket:
+                    log.info("🎯 E1 TRADE | %s | lot:%.2f | SL:%.5f | TP:%.5f | Conf:%.0f%%",
+                             e1_result.direction.name, lot,
+                             e1_result.sl_price, e1_result.tp2_price, e1_result.confidence)
+
+        elif state == EngineState.OFFZONE_REVERSION:
+            # Engine 1 still evaluates for display (even outside KZ)
+            self._last_e1 = self.e1.evaluate()
+
+            # Engine 2: Mean Reversion
+            if not self.nf.is_paused(EngineState.OFFZONE_REVERSION):
+                e2_result = self.e2.evaluate()
+                self._last_e2 = e2_result
+
+                already_open = self.has_open_trade()
+                # FIX ④: skip trade execution when data is stale
+                if e2_result.fired and not _data_stale and not already_open:
+                    comment = (f"IAE_v5_E2|{e2_result.direction.name}|"
+                               f"SWP:{e2_result.sweep_level:.5f}|"
+                               f"VWAP:{e2_result.vwap:.5f}")
+                    ticket = self.executor.open_trade(
+                        self.cfg.SYMBOL, e2_result.direction,
+                        self.cfg.FIXED_LOT,
+                        e2_result.sl_price, e2_result.tp_price, comment)
+
+                    if ticket:
+                        log.info("🌙 E2 TRADE | %s | lot:%.2f | SL:%.5f | TP:%.5f",
+                                 e2_result.direction.name, self.cfg.FIXED_LOT,
+                                 e2_result.sl_price, e2_result.tp_price)
+            else:
+                e2_result = ReversionResult()
+                e2_result.block_reason = FilterFailure.SUSPENDED
+                self._last_e2 = e2_result
+
+        else:
+            # Dead Zone: still evaluate E1 for display
+            self._last_e1 = self.e1.evaluate()
+
+        # Dashboard update
+        acc = self.data.get_account_info()
+        self.dash.update(state, self._last_e1, self._last_e2, self.nf, acc)
+
+    def _refresh_display(self):
+        """
+        Live dashboard refresh — runs every DISPLAY_INTERVAL_SEC.
+        Reads current (live) indicator values for display.
+        Decoupled from bar-close logic so dashboard is always live.
+        """
+        try:
+            state = self.get_engine_state()
+            # Lightweight evaluate: get current conditions without full bar logic
+            e1 = self.e1.evaluate()
+            self._last_e1 = e1
+            # For E2: just update spread/RSI display (fast path)
+            if state == EngineState.OFFZONE_REVERSION:
+                e2 = self.e2.evaluate()
+                self._last_e2 = e2
+            acc = self.data.get_account_info()
+            self.dash.update(state, self._last_e1, self._last_e2, self.nf, acc)
+        except Exception:
+            pass  # Never crash on display refresh
+
+    def check_closed_trades(self):
+        """
+        Check history for closed trades and update neural feedback.
+        FIX: Uses _processed_deals set to ensure each deal is recorded ONCE.
+        Without this, a deal closed 30 min ago gets re-recorded on every bar
+        for 60 minutes = 12 duplicate records corrupting neural accuracy.
+        """
+        from_time = datetime.now(timezone.utc) - timedelta(hours=2)
+        deals = mt5.history_deals_get(from_time, datetime.now(timezone.utc))
+        if deals is None:
+            return
+        for deal in deals:
+            if deal.magic != self.cfg.MAGIC:
+                continue
+            if deal.entry != mt5.DEAL_ENTRY_OUT:
+                continue
+            if deal.ticket in self._processed_deals:
+                continue  # Already recorded — skip
+            cmt    = deal.comment or ""
+            engine = (EngineState.KILL_ZONE_SMC     if "IAE_v5_E1" in cmt
+                      else EngineState.OFFZONE_REVERSION if "IAE_v5_E2" in cmt
+                      else None)
+            if engine is None:
+                continue
+            self.nf.record(engine, deal.profit > 0, deal.profit, 0.0)
+            self._processed_deals.add(deal.ticket)
+            # Keep set size bounded (max 500 tickets)
+            if len(self._processed_deals) > 500:
+                oldest = list(self._processed_deals)[:250]
+                for t in oldest:
+                    self._processed_deals.discard(t)
+
+    def run(self):
+        """Main execution loop"""
+        if not mt5.initialize():
+            log.critical("MT5 initialization FAILED: %s", mt5.last_error())
+            return
+
+        gmt = self.cfg.GMT_OFFSET
+        BDT = 6  # Bangladesh = UTC+6
+        log.info("═" * 65)
+        log.info("  INSTITUTIONAL ALPHA ENGINE v5.0 — ONLINE")
+        log.info("  Symbol: %s | Magic: %d", self.cfg.SYMBOL, self.cfg.MAGIC)
+        log.info("  ── BANGLADESH TIME SCHEDULE (BDT = UTC+6) ──")
+        log.info("  Engine 1 KILL ZONE (Best trades):")
+        log.info("    London Open : UTC %02d:00–%02d:00 = BDT %02d:00–%02d:00",
+                 self.cfg.LONDON_START, self.cfg.LONDON_END,
+                 (self.cfg.LONDON_START+BDT)%24, (self.cfg.LONDON_END+BDT)%24)
+        log.info("    NY Open     : UTC %02d:00–%02d:00 = BDT %02d:00–%02d:00",
+                 self.cfg.NY_START, self.cfg.NY_END,
+                 (self.cfg.NY_START+BDT)%24, (self.cfg.NY_END+BDT)%24)
+        log.info("  Engine 2 MEAN REVERSION (Off-hours):")
+        log.info("    Asian       : UTC 00:00–06:00 = BDT 06:00–12:00")
+        log.info("    Bridge      : UTC 10:00–12:00 = BDT 16:00–18:00")
+        log.info("    Late NY     : UTC 15:00–20:00 = BDT 21:00–02:00")
+        log.info("  Dead Zone (NO TRADING):")
+        log.info("    UTC 20:00–00:00 = BDT 02:00–06:00 (early morning)")
+        log.info("═" * 65)
+
+        self._running = True
+        pos_check_interval = timedelta(seconds=self.cfg.POSITION_MGMT_SEC)
+        last_pos_check     = datetime.now(timezone.utc)
+
+        display_interval   = timedelta(seconds=getattr(self.cfg,'DISPLAY_INTERVAL_SEC',3.0))
+        last_display_update = datetime.now(timezone.utc) - display_interval
+
+        try:
+            while self._running:
+                now = datetime.now(timezone.utc)
+
+                # ── Position management: every 1 second ──────────────────────
+                if now - last_pos_check >= pos_check_interval:
+                    positions = self.data.get_positions(self.cfg.MAGIC, self.cfg.SYMBOL)
+                    if positions:
+                        state = self.get_engine_state()
+                        self.pos_mgr.manage(state)
+                    last_pos_check = now
+
+                # ── Bar-close detection: signal evaluation on new M5 bar ─────
+                df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF, 3)
+                if df is not None and len(df) > 0:
+                    cur_bar_time = df.index[-1]
+                    if cur_bar_time != self._last_bar_time:
+                        self._last_bar_time = cur_bar_time
+                        try:
+                            self.on_bar()
+                            self.check_closed_trades()
+                        except Exception as e:
+                            log.error("on_bar error: %s", str(e), exc_info=True)
+
+                # ── Live dashboard: refresh every DISPLAY_INTERVAL_SEC ───────
+                # This fixes "dashboard frozen" — updates independently of bar close
+                if now - last_display_update >= display_interval:
+                    last_display_update = now
+                    try:
+                        self._refresh_display()
+                    except Exception as e:
+                        log.debug("display refresh error: %s", e)
+
+                time.sleep(self.cfg.POLL_INTERVAL_SEC)
+
+        except KeyboardInterrupt:
+            log.info("Shutdown requested by user")
+        finally:
+            self._running = False
+            mt5.shutdown()
+            log.info("MT5 connection closed. Engine stopped.")
+
+    def stop(self):
+        self._running = False
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 13 — ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Institutional Alpha Engine v5.0 — Python MT5 Bot")
+    parser.add_argument("--symbol",     default="EURUSD",   help="Trading symbol")
+    parser.add_argument("--lot",        type=float, default=0.01, help="Fixed lot (E2)")
+    parser.add_argument("--risk",       type=float, default=1.0,  help="Risk %% per trade (E1)")
+    parser.add_argument("--gmt",        type=int,   default=0,    help="Broker GMT offset")
+    parser.add_argument("--vix-symbol", default="VIX",            help="VIX symbol name")
+    parser.add_argument("--dxy-symbol", default="DXY",            help="DXY symbol name")
+    parser.add_argument("--no-vix",     action="store_true",      help="Disable VIX filter")
+    parser.add_argument("--no-dxy",     action="store_true",      help="Disable DXY filter")
+    parser.add_argument("--no-vp",      action="store_true",      help="Disable Volume Profile")
+    parser.add_argument("--login",      type=int,   default=None, help="MT5 account login")
+    parser.add_argument("--password",   default=None,             help="MT5 account password")
+    parser.add_argument("--server",     default=None,             help="MT5 broker server")
+    args = parser.parse_args()
+
+    # Build configuration
+    cfg = Config(
+        SYMBOL      = args.symbol,
+        FIXED_LOT   = args.lot,
+        RISK_PCT    = args.risk,
+        GMT_OFFSET  = args.gmt,
+        VIX_SYMBOL  = args.vix_symbol,
+        DXY_SYMBOL  = args.dxy_symbol,
+        USE_VIX     = not args.no_vix,
+        USE_DXY     = not args.no_dxy,
+        USE_VP      = not args.no_vp,
+    )
+
+    # Connect to MT5
+    if args.login and args.password and args.server:
+        if not mt5.initialize(login=args.login, password=args.password, server=args.server):
+            log.critical("MT5 login FAILED: %s", mt5.last_error())
+            return
+    else:
+        if not mt5.initialize():
+            log.critical("MT5 initialize FAILED. Is MT5 running? Error: %s", mt5.last_error())
+            return
+
+    # Select symbol
+    if not mt5.symbol_select(cfg.SYMBOL, True):
+        log.critical("Symbol %s not found on broker!", cfg.SYMBOL)
+        mt5.shutdown()
+        return
+
+    info = mt5.symbol_info(cfg.SYMBOL)
+    log.info("Symbol: %s | Digits: %d | Min Lot: %.2f | Contract: %.0f",
+             cfg.SYMBOL, info.digits, info.volume_min, info.trade_contract_size)
+
+    # Run engine
+    engine = AlphaEngine_v5(cfg)
+    engine.run()
+
+
+if __name__ == "__main__":
+    main()
