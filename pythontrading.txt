@@ -175,7 +175,7 @@ class Config:
     E2_TF:                int   = mt5.TIMEFRAME_M5   # Engine 2 sweep TF
     E2_CONFIRM_TF:        int   = mt5.TIMEFRAME_M1   # Engine 2 confirmation TF
     E2_BB_PERIOD:         int   = 20             # Bollinger Band period
-    E2_BB_STDDEV:         float = 2.0            # BB standard deviation (tightened 3→2)
+    E2_BB_STDDEV:         float = 2.5            # BB standard deviation (reduced overtrading)
     E2_RSI_OB:            float = 65.0           # RSI overbought
     E2_RSI_OS:            float = 35.0           # RSI oversold
     E2_MIN_ASIA_RANGE:    float = 25.0           # Minimum Asia range in pips (increased 10→25)
@@ -191,10 +191,11 @@ class Config:
     TRAIL_ATR_MULT_V2:     float = 0.75           # Tighter ATR trailing (was 1.0)
     
     # ── Neural Feedback (IMPROVED v5.1) ──────────────────────────────────────
-    NF_TRADE_MEMORY:       int   = 50             # Minimum trades for circuit breaker (increased 10→50)
     E2_TP_MIN_PIPS:       float = 8.0            # Min TP pips
     E2_TP_MAX_PIPS:       float = 15.0           # Max TP pips
     E2_TP_RR:             float = 1.5            # Engine 2 R:R target
+    NF_MIN_ACCURACY:       float = 65.0           # Circuit breaker threshold
+    NF_PAUSE_MINS:         int   = 120            # Circuit breaker pause mins
 
     # ── Risk Management ($10 Micro Account) ───────────────────────────────────
     RISK_PCT:             float = 1.0            # Risk % of balance (E1)
@@ -203,7 +204,6 @@ class Config:
     MAX_SPREAD_POINTS_E1: int   = 25             # Max spread points E1 (relaxed 15→25)
     MAX_GLOBAL_TRADES:    int   = 1              # Max 1 trade globally (all symbols combined)
     MAX_SLIPPAGE:         int   = 3              # Max slippage points
-    # FIX ④: MT5 disconnect guard — block trading if live data older than this
     MT5_STALE_BLOCK_SEC:  int   = 60             # seconds before stale data blocks trades
     BE_TRIGGER_PIPS:      float = 7.0            # BE trigger (E2)
     BE_BUFFER_PIPS:       float = 0.5            # BE buffer (E2)
@@ -212,11 +212,6 @@ class Config:
     PARTIAL_CLOSE_PCT:    float = 50.0           # Partial close % at TP1
     TRAIL_ATR_MULT:       float = 1.0            # Trailing ATR multiplier
     TRAIL_STEP_POINTS:    float = 10.0           # Trailing step points
-
-    # ── Neural Feedback ───────────────────────────────────────────────────────
-    NF_TRADE_MEMORY:      int   = 10             # Rolling accuracy window
-    NF_MIN_ACCURACY:      float = 65.0           # Circuit breaker threshold
-    NF_PAUSE_MINS:        int   = 120            # Circuit breaker pause mins
 
     # ── News Filter ───────────────────────────────────────────────────────────
     USE_NEWS_FILTER:      bool  = False          # Enable news filter (requires API)
@@ -1290,13 +1285,13 @@ class SMCKillZoneEngine:
         ev = DisplacementEvent()
         
         if not self.cfg.USE_DISPLACEMENT:
-            ev.detected = True  # Disabled = always pass
+            ev.detected = True  # Disabled = pass
             return ev
         
         df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF, 
                                   self.cfg.DISP_LOOKBACK + 10)
         if df is None or len(df) < self.cfg.DISP_LOOKBACK:
-            ev.detected = True  # No data = fail open
+            ev.detected = False  # FAIL CLOSED - no data = block
             return ev
 
         op   = df['open'].values[::-1]
@@ -1385,12 +1380,12 @@ class SMCKillZoneEngine:
         4. That return zone = Bearish Breaker Block
         """
         if not self.cfg.USE_BREAKER_BLOCK:
-            return (True, 0.0)  # Disabled = always pass
+            return (True, 0.0)  # Disabled = pass
         
         df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF, 
                                   self.cfg.BB_LOOKBACK + 10)
         if df is None or len(df) < 20:
-            return (True, 0.0)
+            return (False, 0.0)  # FAIL CLOSED - no data = block
         
         hi   = df['high'].values[::-1]
         lo   = df['low'].values[::-1]
@@ -1441,15 +1436,16 @@ class SMCKillZoneEngine:
         
         This often happens right before a breakout or reversal.
         """
-        result = AbsorptionResult(detected=True)  # Default: pass
+        result = AbsorptionResult(detected=False)  # Default: FAIL CLOSED
         
         if not self.cfg.USE_ABSORPTION:
+            result.detected = True  # Disabled = pass
             return result
         
         df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF,
                                   self.cfg.ABSORPTION_LOOKBACK + 10)
         if df is None or len(df) < self.cfg.ABSORPTION_LOOKBACK:
-            return result
+            return result  # FAIL CLOSED - no data
         
         hi   = df['high'].values[::-1]
         lo   = df['low'].values[::-1]
@@ -1458,7 +1454,7 @@ class SMCKillZoneEngine:
         
         vol_avg = np.mean(vol[5:]) if len(vol) > 5 else np.mean(vol)
         if vol_avg <= 0:
-            return result
+            return result  # FAIL CLOSED
         
         pip = self.data.get_pip_size(self.cfg.SYMBOL)
         
@@ -1961,15 +1957,15 @@ class SMCKillZoneEngine:
             r.absorption_ratio = abs_result.volume_ratio
             
             sm = self.get_session_momentum(check_bull)
-            r.has_session_momentum = sm.direction == tent_dir and sm.strength >= 50
+            # Strengthen threshold: require 70% momentum (was 50%) to reduce false signals
+            r.has_session_momentum = sm.direction == tent_dir and sm.strength >= 70
             r.momentum_strength = sm.strength
             r.momentum_direction = sm.direction
             
-            # IMPROVED: SMC score now includes displacement and breaker block
+            # SMC score: 5 core pillars (displacement is separate gate)
             r.smc_score = sum([
                 r.has_ob, r.has_fvg, r.has_vol_spike, 
-                r.has_divergence, r.has_adx,
-                r.has_displacement  # NEW
+                r.has_divergence, r.has_adx
             ])
         else:
             r.adx_value = self._get_adx()
@@ -2065,19 +2061,17 @@ class SMCKillZoneEngine:
             r.block_reason = FilterFailure.DELTA
             return r
 
-        # Gate 11: Displacement quality (NEW)
+        # Gate 11: Displacement quality (FAIL CLOSED - strict mode)
         if self.cfg.USE_DISPLACEMENT and not r.has_displacement:
-            # Soft gate - allow if no displacement but strong other signals
-            if r.smc_score < 5:
-                r.block_reason = FilterFailure.SMC
-                return r
+            # Hard gate - block if no displacement detected
+            r.block_reason = FilterFailure.SMC
+            return r
 
-        # Gate 12: Breaker Block confirmation (NEW)
+        # Gate 12: Breaker Block confirmation (FAIL CLOSED - strict mode)
         if self.cfg.USE_BREAKER_BLOCK and not r.has_breaker_block:
-            # Soft gate - allow if other strong signals
-            if r.smc_score < 5 and not r.has_ob:
-                r.block_reason = FilterFailure.SMC
-                return r
+            # Hard gate - block if no breaker block confirmed
+            r.block_reason = FilterFailure.SMC
+            return r
 
         # ── ALL GATES PASSED ─────────────────────────────────────────────────
         atr   = self._get_atr()
@@ -2975,7 +2969,7 @@ class AlphaEngine_v5:
         h = utc.hour
         if h >= self.cfg.DEAD_ZONE_START:
             return EngineState.DEAD_ZONE
-        if self.cfg.LONDON_START <= h < self.cfg.LONDON_END:
+        if self.cfg.LONDON_KZ_START_UK <= h < self.cfg.LONDON_KZ_END_UK:
             return EngineState.KILL_ZONE_SMC
         if self.cfg.NY_START    <= h < self.cfg.NY_END:
             return EngineState.KILL_ZONE_SMC
@@ -3141,16 +3135,16 @@ class AlphaEngine_v5:
         gmt = self.cfg.GMT_OFFSET
         BDT = 6  # Bangladesh = UTC+6
         log.info("═" * 65)
-        log.info("  INSTITUTIONAL ALPHA ENGINE v5.0 — ONLINE")
+        log.info("  INSTITUTIONAL ALPHA ENGINE v5.1 — ONLINE")
         log.info("  Symbol: %s | Magic: %d", self.cfg.SYMBOL, self.cfg.MAGIC)
         log.info("  ── BANGLADESH TIME SCHEDULE (BDT = UTC+6) ──")
         log.info("  Engine 1 KILL ZONE (Best trades):")
         log.info("    London Open : UTC %02d:00–%02d:00 = BDT %02d:00–%02d:00",
-                 self.cfg.LONDON_START, self.cfg.LONDON_END,
-                 (self.cfg.LONDON_START+BDT)%24, (self.cfg.LONDON_END+BDT)%24)
+                 self.cfg.LONDON_KZ_START_UK, self.cfg.LONDON_KZ_END_UK,
+                 (self.cfg.LONDON_KZ_START_UK+BDT)%24, (self.cfg.LONDON_KZ_END_UK+BDT)%24)
         log.info("    NY Open     : UTC %02d:00–%02d:00 = BDT %02d:00–%02d:00",
-                 self.cfg.NY_START, self.cfg.NY_END,
-                 (self.cfg.NY_START+BDT)%24, (self.cfg.NY_END+BDT)%24)
+                 self.cfg.NY_KZ_START_EST, self.cfg.NY_KZ_END_EST,
+                 (self.cfg.NY_KZ_START_EST+BDT)%24, (self.cfg.NY_KZ_END_EST+BDT)%24)
         log.info("  Engine 2 MEAN REVERSION (Off-hours):")
         log.info("    Asian       : UTC 00:00–06:00 = BDT 06:00–12:00")
         log.info("    Bridge      : UTC 10:00–12:00 = BDT 16:00–18:00")
