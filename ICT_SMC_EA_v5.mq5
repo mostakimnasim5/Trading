@@ -221,11 +221,17 @@ datetime        g_last_bar_time      = 0;
 datetime        g_last_pos_check     = 0;
 datetime        g_last_closed_trades_check = 0;
 datetime        g_last_asia_build    = 0;
+datetime        g_last_live_fetch    = 0;
 
 // Engine states
 ENUM_ENGINE_STATE     g_current_engine   = ENGINE_DEAD_ZONE;
 ENUM_MARKET_BIAS      g_market_bias      = BIAS_UNKNOWN;
 ENUM_TRADE_DIRECTION  g_current_direction = DIRECTION_NONE;
+
+// Processed deals tracking (to avoid duplicate neural feedback)
+struct DealTicket { long ticket; };
+DealTicket g_processed_deals[];
+int g_processed_deals_count = 0;
 
 // Neural Feedback Stats
 struct EngineStats
@@ -241,6 +247,9 @@ struct EngineStats
    int      loss_streak;
 };
 EngineStats g_e1_stats, g_e2_stats;
+
+// Session-specific stats (Python: session_stats)
+EngineStats g_session_london, g_session_ny, g_session_asian, g_session_other;
 
 // Data caches
 datetime      g_cache_atr_time       = 0;
@@ -259,6 +268,10 @@ AsiaBox g_asia_box;
 // Partial close tracking
 struct PartialInfo { int ticket; bool done; datetime time; };
 PartialInfo g_partial_info[];
+
+// Stale data tracking
+datetime      g_last_mt5_fetch      = 0;
+bool          g_data_stale          = false;
 
 //+------------------------------------------------------------------+
 //| Helper Functions                                                 |
@@ -358,6 +371,13 @@ int GetUTC_Hour()
    return st.hour - InpGMT_Offset;
 }
 
+int GetWeekday()
+{
+   MqlDateTime st;
+   TimeToStruct(TimeCurrent(), st);
+   return st.day_of_week; // 0=Sunday, 1=Monday, ..., 5=Saturday, 6=Sunday
+}
+
 datetime GetTodayMidnightUTC()
 {
    datetime now = TimeCurrent() - InpGMT_Offset * 3600;
@@ -372,6 +392,81 @@ int GetHour()
    MqlDateTime st;
    TimeToStruct(TimeCurrent(), st);
    return st.hour;
+}
+
+//+------------------------------------------------------------------+
+//| STALE DATA CHECKING (FIX ④: Match Python logic)                  |
+//+------------------------------------------------------------------+
+bool IsDataStale()
+{
+   datetime now = TimeCurrent();
+   if(g_last_mt5_fetch == 0) g_last_mt5_fetch = now;
+   
+   double test_ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+   double test_bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+   
+   if(test_ask > 0 && test_bid > 0)
+   {
+      g_last_mt5_fetch = now;
+      g_data_stale = false;
+   }
+   else
+   {
+      g_data_stale = (now - g_last_mt5_fetch) > (datetime)InpStaleBlockSec;
+   }
+   
+   return g_data_stale;
+}
+
+//+------------------------------------------------------------------+
+//| GLOBAL TRADE COUNTING (FIX ③: Match Python logic)                |
+//+------------------------------------------------------------------+
+int CountGlobalTrades()
+{
+   int count = 0;
+   uint total = PositionsTotal();
+   for(uint i = 0; i < total; i++)
+   {
+      if(!PositionGetSymbol(i)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagic)
+         count++;
+   }
+   return count;
+}
+
+bool HasOpenTrade()
+{
+   return CountGlobalTrades() >= InpMaxGlobalTrades;
+}
+
+//+------------------------------------------------------------------+
+//| SESSION TRACKING (Match Python session_stats)                     |
+//+------------------------------------------------------------------+
+string GetCurrentSession()
+{
+   string kz_type = "";
+   if(IsInKillZone(kz_type))
+   {
+      if(kz_type == "LONDON") return "LONDON";
+      if(kz_type == "NY") return "NY";
+   }
+   int utc_h = GetUTC_Hour();
+   if(utc_h >= 0 && utc_h < 12) return "ASIAN";
+   return "OTHER";
+}
+
+void RecordToSessionStats(string session, bool is_win, double profit)
+{
+   EngineStats &s = (session == "LONDON") ? g_session_london :
+                    (session == "NY") ? g_session_ny :
+                    (session == "ASIAN") ? g_session_asian : g_session_other;
+   
+   s.total_trades++;
+   s.today_trades++;
+   s.today_pnl += profit;
+   if(is_win) s.wins++;
+   if(s.total_trades > 0)
+      s.accuracy = (double)s.wins / s.total_trades * 100.0;
 }
 
 //+------------------------------------------------------------------+
@@ -2211,7 +2306,7 @@ void ManagePositions(ENUM_ENGINE_STATE engine)
 }
 
 //+------------------------------------------------------------------+
-//| NEURAL FEEDBACK SYSTEM                                           |
+//| NEURAL FEEDBACK SYSTEM (Match Python: streaks, hot/cold streak)    |
 //+------------------------------------------------------------------+
 void RecordTrade(ENUM_ENGINE_STATE engine, bool is_win, double profit, double confidence)
 {
@@ -2222,8 +2317,9 @@ void RecordTrade(ENUM_ENGINE_STATE engine, bool is_win, double profit, double co
    stats.today_pnl += profit;
    if(is_win) stats.wins++;
    if(stats.total_trades > 0)
-      stats.accuracy = (double)stats.wins / stats.total_trades * 100;
+      stats.accuracy = (double)stats.wins / stats.total_trades * 100.0;
    
+   // Streak tracking (Python: win_streak, loss_streak)
    if(is_win)
    {
       stats.win_streak++;
@@ -2235,12 +2331,14 @@ void RecordTrade(ENUM_ENGINE_STATE engine, bool is_win, double profit, double co
       stats.win_streak = 0;
    }
    
+   // Circuit breaker (Python: _update_circuit_breaker)
    if(stats.total_trades >= InpNF_TradeMemory)
    {
       if(stats.accuracy < InpNF_MinAccuracy && !stats.is_paused)
       {
          stats.is_paused = true;
          stats.paused_until = TimeCurrent() + InpNF_PauseMins * 60;
+         Print("WARNING: Engine ", engine, " PAUSED for ", InpNF_PauseMins, " min | Accuracy:", stats.accuracy, "% | Trades:", stats.total_trades);
       }
       else if(stats.accuracy >= 85.0)
       {
@@ -2261,6 +2359,28 @@ bool IsEnginePaused(ENUM_ENGINE_STATE engine)
       return false;
    }
    return stats.is_paused;
+}
+
+// Hot streak check (Python: is_hot_streak)
+bool IsHotStreak(int min_wins = 3)
+{
+   return g_e1_stats.win_streak >= min_wins || g_e2_stats.win_streak >= min_wins;
+}
+
+// Cold streak check (Python: is_cold_streak)
+bool IsColdStreak(int min_losses = 3)
+{
+   return g_e1_stats.loss_streak >= min_losses || g_e2_stats.loss_streak >= min_losses;
+}
+
+// Get session accuracy (Python: get_session_accuracy)
+double GetSessionAccuracy(string session, int &total_trades)
+{
+   EngineStats &s = (session == "LONDON") ? g_session_london :
+                    (session == "NY") ? g_session_ny :
+                    (session == "ASIAN") ? g_session_asian : g_session_other;
+   total_trades = s.total_trades;
+   return s.accuracy;
 }
 
 //+------------------------------------------------------------------+
@@ -2310,14 +2430,19 @@ bool OpenTrade(string symbol, ENUM_TRADE_DIRECTION direction, double lot, double
 }
 
 //+------------------------------------------------------------------+
-//| ENGINE STATE DETERMINATION                                        |
+//| ENGINE STATE DETERMINATION (Match Python: includes weekend check)  |
 //+------------------------------------------------------------------+
 ENUM_ENGINE_STATE GetEngineState()
 {
+   // FIX: Weekend check (Python: dow >= 5 returns DEAD_ZONE)
+   int dow = GetWeekday(); // 5=Saturday, 6=Sunday
+   if(dow >= 5) return ENGINE_DEAD_ZONE;
+   
    int utc_h = GetUTC_Hour();
    
-   if(utc_h >= InpDeadZoneStart || utc_h < 0) return ENGINE_DEAD_ZONE;
+   if(utc_h >= InpDeadZoneStart) return ENGINE_DEAD_ZONE;
    
+   // Check Kill Zones using DST-aware detection
    string kz_type;
    if(IsInKillZone(kz_type)) return ENGINE_KILLZONE_SMC;
    
@@ -2325,9 +2450,41 @@ ENUM_ENGINE_STATE GetEngineState()
 }
 
 //+------------------------------------------------------------------+
-//| CHECK CLOSED TRADES                                               |
+//| CHECK CLOSED TRADES (Match Python: processed_deals tracking)       |
 //+------------------------------------------------------------------+
 datetime g_last_deal_check = 0;
+
+bool IsDealProcessed(long ticket)
+{
+   for(int i = 0; i < g_processed_deals_count; i++)
+   {
+      if(g_processed_deals[i].ticket == ticket)
+         return true;
+   }
+   return false;
+}
+
+void AddProcessedDeal(long ticket)
+{
+   // Resize array if needed
+   int new_size = g_processed_deals_count + 1;
+   ArrayResize(g_processed_deals, new_size);
+   g_processed_deals[g_processed_deals_count].ticket = ticket;
+   g_processed_deals_count++;
+   
+   // Keep bounded to 500 (Python: max 500 tickets)
+   if(g_processed_deals_count > 500)
+   {
+      // Remove oldest 250
+      for(int i = 0; i < 250; i++)
+      {
+         for(int j = 0; j < g_processed_deals_count - 1; j++)
+            g_processed_deals[j] = g_processed_deals[j + 1];
+         g_processed_deals_count--;
+      }
+      ArrayResize(g_processed_deals, g_processed_deals_count);
+   }
+}
 
 void CheckClosedTrades()
 {
@@ -2344,6 +2501,9 @@ void CheckClosedTrades()
       ulong ticket = HistoryDealGetTicket(i);
       if(ticket == 0) continue;
       
+      // FIX: Skip already processed deals (Python: deal.ticket in self._processed_deals)
+      if(IsDealProcessed((long)ticket)) continue;
+      
       ulong magic = HistoryDealGetInteger(ticket, DEAL_MAGIC);
       if(magic != InpMagic) continue;
       
@@ -2357,14 +2517,24 @@ void CheckClosedTrades()
       if(StringFind(comment, "IAE_v5_E2") >= 0) engine = ENGINE_OFFZONE_REVERSION;
       else if(StringFind(comment, "IAE_v5_E1") < 0) continue;
       
+      // Get session for session stats
+      string session = GetCurrentSession();
+      
+      // Record to Neural Feedback
       RecordTrade(engine, profit > 0, profit, 0);
+      
+      // Record to session stats (Python: session_stats[session].record)
+      RecordToSessionStats(session, profit > 0, profit);
+      
+      // Add to processed deals
+      AddProcessedDeal((long)ticket);
    }
    
    HistorySelect(0, TimeCurrent());
 }
 
 //+------------------------------------------------------------------+
-//| MAIN EA ONTICK                                                    |
+//| MAIN EA ONTICK (Match Python: stale data, global trades, comments)  |
 //+------------------------------------------------------------------+
 void OnTick()
 {
@@ -2375,31 +2545,36 @@ void OnTick()
       
       g_current_engine = GetEngineState();
       
+      // FIX ④: Block ALL trading when MT5 data is stale
+      bool data_stale = IsDataStale();
+      if(data_stale)
+      {
+         // Still evaluate but don't trade - trade execution BLOCKED
+      }
+      
+      // Position management
+      ManagePositions(g_current_engine);
+      
       if(g_current_engine == ENGINE_KILLZONE_SMC)
       {
          SMCResult smc = EvaluateEngine1();
          g_smc_result = smc;
          
-         if(smc.fired && !IsEnginePaused(ENGINE_KILLZONE_SMC))
+         // FIX ④: skip trade execution when data is stale
+         if(smc.fired && !data_stale && !IsEnginePaused(ENGINE_KILLZONE_SMC) && !HasOpenTrade())
          {
-            bool has_pos = false;
-            uint total = PositionsTotal();
-            for(uint i = 0; i < total; i++)
-            {
-               if(!PositionGetSymbol(i)) continue;
-               if(PositionGetInteger(POSITION_MAGIC) == InpMagic && 
-                  PositionGetString(POSITION_SYMBOL) == InpSymbol)
-               { has_pos = true; break; }
-            }
+            double atr = GetCachedATR();
+            double sl_pips = atr * InpATR_SL_Mult / GetPipSize();
+            double lot = CalculateLotE1(sl_pips);
             
-            if(!has_pos)
+            // FIX: Match Python comment format "IAE_v5_E1|Direction|Conf:XX%|SMC:X/5"
+            string dir_str = (smc.direction == DIRECTION_BUY) ? "BUY" : "SELL";
+            string comment = "IAE_v5_E1|" + dir_str + "|Conf:" + DoubleToString(smc.confidence, 0) + "%|SMC:" + IntegerToString(smc.smc_score) + "/5";
+            
+            // FIX: Use TP2 for final exit (Python: tp2_price)
+            if(OpenTrade(InpSymbol, smc.direction, lot, smc.sl_price, smc.tp2_price, comment))
             {
-               double atr = GetCachedATR();
-               double sl_pips = atr * InpATR_SL_Mult / GetPipSize();
-               double lot = CalculateLotE1(sl_pips);
-               string comment = "IAE_v5_E1";
-               
-               OpenTrade(InpSymbol, smc.direction, lot, smc.sl_price, smc.tp1_price, comment);
+               Print("E1 TRADE | ", dir_str, " | lot:", lot, " | SL:", smc.sl_price, " | TP:", smc.tp2_price, " | Conf:", smc.confidence);
             }
          }
       }
@@ -2407,22 +2582,19 @@ void OnTick()
       {
          RevResult rev = EvaluateEngine2();
          
-         if(rev.fired && !IsEnginePaused(ENGINE_OFFZONE_REVERSION))
+         if(rev.fired && !IsEnginePaused(ENGINE_OFFZONE_REVERSION) && !HasOpenTrade())
          {
-            bool has_pos = false;
-            uint total = PositionsTotal();
-            for(uint i = 0; i < total; i++)
+            // FIX: Skip trade when data is stale
+            if(!data_stale)
             {
-               if(!PositionGetSymbol(i)) continue;
-               if(PositionGetInteger(POSITION_MAGIC) == InpMagic &&
-                  PositionGetString(POSITION_SYMBOL) == InpSymbol)
-               { has_pos = true; break; }
-            }
-            
-            if(!has_pos)
-            {
-               string comment = "IAE_v5_E2";
-               OpenTrade(InpSymbol, rev.direction, InpFixedLot, rev.sl_price, rev.tp_price, comment);
+               // FIX: Match Python comment format "IAE_v5_E2|Direction|SWP:price|VWAP:price"
+               string dir_str = (rev.direction == DIRECTION_BUY) ? "BUY" : "SELL";
+               string comment = "IAE_v5_E2|" + dir_str + "|SWP:" + DoubleToString(rev.sweep_level, 5) + "|VWAP:" + DoubleToString(rev.vwap, 5);
+               
+               if(OpenTrade(InpSymbol, rev.direction, InpFixedLot, rev.sl_price, rev.tp_price, comment))
+               {
+                  Print("E2 TRADE | ", dir_str, " | lot:", InpFixedLot, " | SL:", rev.sl_price, " | TP:", rev.tp_price);
+               }
             }
          }
       }
@@ -2439,7 +2611,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| EA ONINIT                                                          |
+//| EA ONINIT (Match Python: initialize all stats)                       |
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -2449,17 +2621,39 @@ int OnInit()
    g_trade.SetAsyncMode(false);
    
    ArrayResize(g_partial_info, 0);
+   ArrayResize(g_processed_deals, 0);
+   g_processed_deals_count = 0;
    
+   // Initialize E1 stats
    g_e1_stats.total_trades = 0;
    g_e1_stats.wins = 0;
-   g_e1_stats.accuracy = 100;
+   g_e1_stats.accuracy = 100.0;
    g_e1_stats.is_paused = false;
    g_e1_stats.today_trades = 0;
    g_e1_stats.today_pnl = 0;
    g_e1_stats.win_streak = 0;
    g_e1_stats.loss_streak = 0;
    
+   // Initialize E2 stats
    g_e2_stats = g_e1_stats;
+   
+   // Initialize Session stats (Python: session_stats)
+   g_session_london.total_trades = 0;
+   g_session_london.wins = 0;
+   g_session_london.accuracy = 100.0;
+   g_session_london.is_paused = false;
+   g_session_london.today_trades = 0;
+   g_session_london.today_pnl = 0;
+   g_session_london.win_streak = 0;
+   g_session_london.loss_streak = 0;
+   
+   g_session_ny = g_session_london;
+   g_session_asian = g_session_london;
+   g_session_other = g_session_london;
+   
+   // Initialize stale data tracking
+   g_last_mt5_fetch = 0;
+   g_data_stale = false;
    
    if(!SymbolSelect(InpSymbol, true))
    {
@@ -2470,6 +2664,7 @@ int OnInit()
    Print("=== INSTITUTIONAL ALPHA ENGINE v5.0 INITIALIZED ===");
    Print("Symbol: ", InpSymbol, " | Magic: ", InpMagic);
    Print("DXY: ", InpUseDXY, " | VIX: ", InpUseVIX, " | VP: ", InpUseVP);
+   Print("MAX_GLOBAL_TRADES: ", InpMaxGlobalTrades, " | STALE_BLOCK_SEC: ", InpStaleBlockSec);
    
    return INIT_SUCCEEDED;
 }
