@@ -194,6 +194,7 @@ class Config:
     E2_TP_MIN_PIPS:       float = 8.0            # Min TP pips
     E2_TP_MAX_PIPS:       float = 15.0           # Max TP pips
     E2_TP_RR:             float = 1.5            # Engine 2 R:R target
+    NF_TRADE_MEMORY:       int   = 50             # Minimum trades for circuit breaker
     NF_MIN_ACCURACY:       float = 65.0           # Circuit breaker threshold
     NF_PAUSE_MINS:         int   = 120            # Circuit breaker pause mins
 
@@ -1535,55 +1536,13 @@ class SMCKillZoneEngine:
         
         return sm
 
-    # ── Liquidity Sweep Quality Check (NEW) ────────────────────────────────
+    	    # ── Liquidity Sweep Quality Check (NEW) ────────────────────────────────
     def check_sweep_quality(self, is_bull: bool) -> bool:
         """
-        QUALITY SWEEP = When liquidity is swept, price must:
-        1. Reverse quickly (within LIQ_REVERSAL_BARS)
-        2. Show volume spike at the sweep
-        3. Form a rejection candle
-        
-        This filters out "failed sweeps" that continue in the sweep direction.
+        QUALITY SWEEP = Always pass (disabled for now).
+        Can be enabled later with additional validation.
         """
-        if not self.cfg.LIQ_SWEEP_QUALITY:
-            return True  # Disabled = pass
-        
-        df = self.data.get_rates(self.cfg.SYMBOL, self.cfg.ENTRY_TF,
-                                  self.cfg.LIQ_REVERSAL_BARS + 10)
-        if df is None or len(df) < self.cfg.LIQ_REVERSAL_BARS + 5:
-            return True
-        
-        hi   = df['high'].values[::-1]
-        lo   = df['low'].values[::-1]
-        cl   = df['close'].values[::-1]
-        op   = df['open'].values[::-1]
-        vol  = df['tick_volume'].values[::-1]
-        vol_avg = np.mean(vol[5:]) if len(vol) > 5 else np.mean(vol)
-        
-        if vol_avg <= 0:
-            return True
-        
-        # Check for sweep and quick reversal
-        for i in range(1, min(self.cfg.LIQ_REVERSAL_BARS + 1, len(hi))):
-            vol_ratio = vol[i] / vol_avg
-            
-            if is_bull:
-                # Low was swept and price reversed up
-                if cl[i] > op[i] and vol_ratio >= self.cfg.LIQ_VOL_CONFIRM:
-                    # Check if there was a sweep before this candle
-                    if i > 1:
-                        prev_lo = min(lo[i+1:min(i+4, len(lo))])
-                        if lo[i-1] < prev_lo:  # Previous bars had lower lows = sweep happened
-                            return True
-            else:
-                # High was swept and price reversed down
-                if cl[i] < op[i] and vol_ratio >= self.cfg.LIQ_VOL_CONFIRM:
-                    if i > 1:
-                        prev_hi = max(hi[i+1:min(i+4, len(hi))])
-                        if hi[i-1] > prev_hi:  # Previous bars had higher highs = sweep happened
-                            return True
-        
-        return True  # No clear sweep = pass (don't block)
+        return True  # Always pass
 
     # ── RSI/MACD Divergence ─────────────────────────────────────────────────
 
